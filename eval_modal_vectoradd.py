@@ -120,6 +120,15 @@ def evaluate_kernel(kernel_code: str, mode: str = "leaderboard") -> str:
             std, err = 0.0, 0.0
         return {"runs": n, "mean": avg, "std": std, "err": err}
 
+    # Flush buffer: 2× H100 L2 size (50 MB) to guarantee full cache eviction.
+    # Written before each timed kernel call so every measurement sees cold HBM,
+    # regardless of what the submission caches internally.
+    _l2_flush = torch.zeros(100 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+
+    def _flush_l2():
+        _l2_flush.zero_()
+        torch.cuda.synchronize()
+
     def _bench_single(kernel_fn, bench_args, max_time_ns=None):
         if max_time_ns is None:
             max_time_ns = BENCH_MAX_TIME_NS
@@ -141,7 +150,7 @@ def evaluate_kernel(kernel_code: str, mode: str = "leaderboard") -> str:
 
         with ctx:
             for i in range(BENCH_MAX_REPEATS):
-                torch.cuda.synchronize()
+                _flush_l2()
 
                 if BENCH_USE_CUDA_EVENTS:
                     s = torch.cuda.Event(enable_timing=True)
