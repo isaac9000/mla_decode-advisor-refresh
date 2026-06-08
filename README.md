@@ -1,10 +1,6 @@
-# GPU Kernel Autoresearch
+# VectorAdd Autoresearch
 
-An advisor-worker agent pair that iteratively optimizes CUDA kernels on NVIDIA H100. Each iteration the **advisor** reviews experiment history and proposes a strategic direction; the **worker** implements it, evaluates on an H100 via Modal, and logs the result.
-
-Two tasks are supported:
-- **grayscale/** — RGB-to-grayscale conversion (float32)
-- **vectoradd/** — float16 element-wise vector addition
+An advisor-worker agent pair that iteratively optimizes a CUDA kernel for float16 vector addition on NVIDIA H100. Each iteration the **advisor** reviews experiment history and proposes a strategic direction; the **worker** implements it, evaluates on an H100 via Modal, and logs the result.
 
 ## Task
 
@@ -65,8 +61,6 @@ uv run modal deploy eval_modal_vectoradd.py
 
 ## Running the agent
 
-### VectorAdd (float16)
-
 ```bash
 uv run vectoradd/agent.py --iterations 20
 ```
@@ -75,6 +69,12 @@ Start from the provided starting point:
 
 ```bash
 uv run vectoradd/agent.py --baseline vectoradd/starting_point.py --iterations 20
+```
+
+Use different models for advisor and worker:
+
+```bash
+uv run vectoradd/agent.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6 --iterations 20
 ```
 
 Or use the provided script (checks for H100 then launches in tmux):
@@ -91,37 +91,11 @@ python run_eval.py submission.py -o results.json
 python run_eval.py submission.py -o results.json --mode test   # correctness only
 ```
 
-### Grayscale (float32)
-
-```bash
-uv run grayscale/agent.py --iterations 20
-```
-
-Start from a specific baseline file:
-
-```bash
-uv run grayscale/agent.py --baseline grayscale/submission.py --iterations 20
-```
-
-Use different models for advisor and worker:
-
-```bash
-uv run grayscale/agent.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6 --iterations 20
-```
-
 ## Structure
 
 ```
-eval_modal_grayscale.py   — deployable Modal H100 evaluator (grayscale)
-eval_modal_vectoradd.py   — deployable Modal H100 evaluator (vectoradd)
-grayscale/
-├── agent.py              — advisor-worker agentic loop
-├── advisor_prompt.md     — advisor system prompt: strategy, comparison discipline
-├── worker_prompt.md      — worker system prompt: mandatory sequence, rules
-├── submission.py         — the kernel file the worker edits each iteration
-├── run_eval.py           — submits submission.py to the deployed Modal evaluator
-├── tools.py              — log_experiment and get_experiment_history tools
-└── runs/                 — one directory per run: history, TSV log, plots, best submission
+eval_modal_vectoradd.py   — deployable Modal H100 evaluator
+run_agent.sh              — H100 check + tmux agent launcher
 vectoradd/
 ├── agent.py              — advisor-worker agentic loop
 ├── advisor_prompt.md     — advisor system prompt: strategy, comparison discipline
