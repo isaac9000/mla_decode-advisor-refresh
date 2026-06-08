@@ -9,5 +9,5 @@ import torch
 
 def custom_kernel(data):
     a, b = data
-    return torch.add(a, b, out=a)
+    return torch.add(a, b, alpha=1, out=a)
 # EVOLVE-BLOCK-END
