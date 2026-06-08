@@ -19,7 +19,7 @@ You are the PI for an iterative kernel optimization loop. A worker agent impleme
 | 4096  | 16.8        | 100       | ~30      |
 | 8192  | 67.1        | 402       | ~120     |
 
-SOL = (N² × 6 bytes) ÷ (3.35 TB/s H100 HBM3 bandwidth). Each pixel costs 3 memory ops: read A (2 bytes), read B (2 bytes), write C (2 bytes). This is a **pure memory-bandwidth-bound** problem — the arithmetic (one addition per element) is negligible.
+SOL = (N² × 6 bytes) ÷ (3.35 TB/s H100 HBM3 bandwidth). This is a memory-bandwidth-bound problem.
 
 **Metric:** Geometric mean latency across all 4 benchmark sizes (lower is better).
 **Score:** 3000 / geomean_us (higher is better).
@@ -27,12 +27,11 @@ SOL = (N² × 6 bytes) ÷ (3.35 TB/s H100 HBM3 bandwidth). Each pixel costs 3 me
 
 ### Technical notes
 
-- Both inputs are `(N, N)` float16 contiguous — the elements are already laid out sequentially in memory, so any linear traversal is coalesced.
+- Both inputs are `(N, N)` float16 contiguous — elements are laid out sequentially in memory.
 - H100 L2 cache is 50 MB; sizes ≤ N=2048 (~25 MB total data) may partially benefit from L2; larger sizes are fully HBM-bound.
 - Triton and inline CUDA (via `torch.utils.cpp_extension.load_inline`) are both available; pure PyTorch is also valid.
-- For small sizes (N≤1024) kernel launch overhead (~1–5 µs) is a significant fraction of total time.
-- float16 vectorization: H100 can issue 128-bit loads/stores, loading 8 float16 values at once — this is critical for maximizing memory throughput.
-- `torch.add(A, B)` invokes a highly tuned cuBLAS/cuDNN path; it is a valid baseline and hard to beat without careful vectorization.
+- For small sizes (N≤1024) kernel launch overhead is ~1–5 µs.
+- H100 supports 128-bit loads/stores (8 float16 values per transaction).
 
 ---
 
