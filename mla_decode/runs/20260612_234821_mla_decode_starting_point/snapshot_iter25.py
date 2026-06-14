@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os

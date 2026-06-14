@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -177,7 +175,7 @@ def _attention_inner(
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
     """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
+    Compiled attention inner loop.
     Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
     """
     # Apply RoPE to queries
@@ -190,7 +188,7 @@ def _attention_inner(
     # Absorb wK
     q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
 
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
+    # Score computation (kv_nope_T pre-transposed, no transpose inside compiled graph)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
     scores = (scores_nope + scores_rope) * scale

@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -170,15 +168,15 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
+
 def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+    q_nope, q_rope, kv_nope_input, k_rope_input,
     cos_q, sin_q, cos_k, sin_k,
     wK, wV_T, wO,
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
     """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
+    Attention inner loop: dynamic=True so autotuner handles variable kv_len.
     """
     # Apply RoPE to queries
     q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
@@ -187,10 +185,11 @@ def _attention_inner(
     k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
     k_rope = k_rope_input * cos_k + k_rope_half * sin_k
 
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
+    # Absorb wK: q_nope_latent [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
+    # Score computation
+    kv_nope_T = kv_nope_input.transpose(1, 2)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
     scores = (scores_nope + scores_rope) * scale
@@ -200,21 +199,40 @@ def _attention_inner(
     M = torch.matmul(attn, kv_nope_input)
 
     # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
     y = y_head.reshape(bs, nh * dv).unsqueeze(1)
     return F.linear(y, wO)
 
 
+# dynamic=True for attention (kv_len varies), max-autotune-no-cudagraphs for fusion
 _compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
+    _attention_inner, mode='max-autotune-no-cudagraphs', dynamic=True
+)
+
+
+def _static_projections(x_2d, wDQ, wUQ, wDKV):
+    """
+    Static-shape outer projections: shapes are always [128, 7168] x fixed weights.
+    Compiled with dynamic=False so autotuner picks optimal tiles for exact shapes.
+    Returns (q_lora, q_up_flat, kv_lora_input).
+    """
+    q_lora = F.linear(x_2d, wDQ)        # [bs, dq]
+    q_up   = F.linear(q_lora, wUQ)       # [bs, nh*(d_nope+d_rope)]
+    kv_lora_input = F.linear(x_2d, wDKV) # [bs, dkv+d_rope]
+    return q_lora, q_up, kv_lora_input
+
+
+# Use reduce-overhead for static projections (fast compilation, good kernel launch fusion)
+_compiled_projections = torch.compile(
+    _static_projections, mode='reduce-overhead', dynamic=False
 )
 
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised MLA decode with dual compilation strategy:
+    - Outer projections (wDQ, wUQ, wDKV): dynamic=False for static-shape autotuning
+    - Attention inner loop: dynamic=True for kv_len-variable autotuning
     """
     config, x, kv_cache = data
 
@@ -232,22 +250,21 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     wUKV = config.KV_proj_up_weight
     wO   = config.wo_weight
 
-    q_lora = F.linear(x, wDQ)
-    kv_lora_input = F.linear(x, wDKV)
+    x_2d = x.squeeze(1)  # [bs, dim]
 
-    kv_lora, kv_len = kv_cache(kv_lora_input)
+    # Static projections (compiled with dynamic=False for optimal tile selection)
+    q_lora, q_up_flat, kv_lora_input_2d = _compiled_projections(x_2d, wDQ, wUQ, wDKV)
+
+    # KV cache update (Python state, must stay outside compile)
+    kv_lora, kv_len = kv_cache(kv_lora_input_2d.unsqueeze(1))
     query_pos = kv_len - 1
 
-    q_up = F.linear(q_lora.squeeze(1), wUQ)
-    q_up = q_up.view(bs, nh, d_nope + d_rope)
+    q_up = q_up_flat.view(bs, nh, d_nope + d_rope)
     q_nope = q_up[..., :d_nope]
     q_rope = q_up[..., d_nope:]
 
     kv_nope_input = kv_lora[..., :dkv]
     k_rope_input  = kv_lora[..., dkv:]
-
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
     cos_q = cos_table[query_pos]
@@ -263,7 +280,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
     output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+        q_nope, q_rope, kv_nope_input, k_rope_input,
         cos_q, sin_q, cos_k, sin_k,
         wK, wV_T, wO,
         bs, nh, dkv, d_nope, d_rope, dv, scale,

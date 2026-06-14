@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -170,51 +168,56 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
+
 def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+    q_nope, q_rope, kv_nope_input, k_rope_input,
     cos_q, sin_q, cos_k, sin_k,
     wK, wV_T, wO,
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
     """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
+    Fused single-pass KV scoring:
+    Instead of two separate matmuls (nope + rope), concatenate Q and K into
+    combined [bs, nh, dkv+d_rope] and [bs, kv_len, dkv+d_rope] and do ONE matmul.
+    This reads the KV cache once for scoring (vs twice), saving one HBM pass.
+    Value aggregation (attn @ kv_nope) still requires a separate KV read.
     """
     # Apply RoPE to queries
     q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
 
     # Apply RoPE to keys
     k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
+    k_rope = k_rope_input * cos_k + k_rope_half * sin_k  # [bs, kv_len, d_rope]
 
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
+    # Absorb wK into q_nope: [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores = (scores_nope + scores_rope) * scale
+    # Fused score: single matmul over combined [dkv + d_rope] dimension
+    # Q_combined: [bs, nh, dkv+d_rope]
+    # K_combined: [bs, kv_len, dkv+d_rope]  (one contiguous tensor — single HBM read)
+    Q_combined = torch.cat([q_nope_latent, q_rope], dim=-1)          # [bs, nh, dkv+d_rope]
+    K_combined = torch.cat([kv_nope_input, k_rope], dim=-1)          # [bs, kv_len, dkv+d_rope]
+    scores = torch.matmul(Q_combined, K_combined.transpose(1, 2)) * scale  # [bs, nh, kv_len]
 
-    # Softmax + attention output
+    # Softmax + attention output (still reads kv_nope separately for V)
     attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)
+    M = torch.matmul(attn, kv_nope_input)  # [bs, nh, dkv]
 
     # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)  # [bs, nh, dv]
     y = y_head.reshape(bs, nh * dv).unsqueeze(1)
     return F.linear(y, wO)
 
 
 _compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
+    _attention_inner, mode='max-autotune-no-cudagraphs', dynamic=True
 )
 
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised MLA decode: fused single-pass KV scoring reduces KV cache reads
+    from 3× to 2× by concatenating nope+rope scores into one matmul.
     """
     config, x, kv_cache = data
 
@@ -246,9 +249,6 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = kv_lora[..., :dkv]
     k_rope_input  = kv_lora[..., dkv:]
 
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
-
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
     cos_q = cos_table[query_pos]
     sin_q = sin_table[query_pos]
@@ -263,7 +263,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
     output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+        q_nope, q_rope, kv_nope_input, k_rope_input,
         cos_q, sin_q, cos_k, sin_k,
         wK, wV_T, wO,
         bs, nh, dkv, d_nope, d_rope, dv, scale,

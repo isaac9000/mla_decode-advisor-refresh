@@ -52,16 +52,7 @@ MLA decode has three major phases:
 
 The KV cache stores compressed latent vectors (kv_lora_rank=512) and RoPE keys (qk_rope_head_dim=64). The absorption trick allows the full key/value projections (wUKV) to be folded into the query projection, avoiding materializing per-head K and V.
 
-**Memory bandwidth is the bottleneck** at large prefill: the full kv_cache (bs=128 × prefill × 576 × 2 bytes) must be streamed for attention.
-
 **Reference implementation uses:** standard PyTorch ops (F.linear, matmul, softmax). The starting point adds Triton kernels for softmax and RoPE.
-
-**Key optimization axes:**
-- Fused attention kernels (FlashAttention-style paged/decode attention)
-- KV cache absorption: fold wUKV into query, compute attention directly in latent space
-- Batched GEMM for LoRA projections
-- Kernel fusion to reduce memory round-trips
-- Exploiting that sq=1 (decode-only): no causal masking needed
 
 ---
 

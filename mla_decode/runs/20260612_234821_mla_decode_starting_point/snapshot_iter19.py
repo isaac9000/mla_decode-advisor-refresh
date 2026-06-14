@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -170,51 +168,148 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
+
+@triton.jit
+def _mla_flash_kernel(
+    # q_nope_latent [bs, nh, DKV], q_rope [bs, nh, DROPE]
+    qnl_ptr, stride_qnl_b, stride_qnl_h, stride_qnl_d,
+    qr_ptr,  stride_qr_b,  stride_qr_h,  stride_qr_d,
+    # kv_nope [bs, S, DKV], k_rope [bs, S, DROPE]
+    kvn_ptr, stride_kvn_b, stride_kvn_s, stride_kvn_d,
+    kr_ptr,  stride_kr_b,  stride_kr_s,  stride_kr_d,
+    # output [bs, nh, DKV]
+    out_ptr, stride_ob, stride_oh, stride_od,
+    kv_len, scale, NH,
+    DKV: tl.constexpr,   # 512
+    DROPE: tl.constexpr, # 64
+    BLOCK_KV: tl.constexpr,  # tile over kv sequence
+    BLOCK_D: tl.constexpr,   # 128 — DKV/4, for accumulator chunking
+):
+    """
+    One CTA per (batch, head). Online softmax flash-attention.
+    Accumulator split into 4 BLOCK_D=128 chunks to manage register pressure.
+    Boundary fix: use full kv_len range with mask (avoids non-constant range bounds).
+    """
+    pid = tl.program_id(0)
+    b = pid // NH
+    h = pid % NH
+
+    qnl_base = qnl_ptr + b * stride_qnl_b + h * stride_qnl_h
+    qr_base  = qr_ptr  + b * stride_qr_b  + h * stride_qr_h
+    kvn_base = kvn_ptr + b * stride_kvn_b
+    kr_base  = kr_ptr  + b * stride_kr_b
+
+    d_offs  = tl.arange(0, BLOCK_D)
+    r_offs  = tl.arange(0, DROPE)
+    kv_offs = tl.arange(0, BLOCK_KV)
+
+    # Load q vectors
+    qn0 = tl.load(qnl_base + (0*BLOCK_D + d_offs) * stride_qnl_d).to(tl.float32)
+    qn1 = tl.load(qnl_base + (1*BLOCK_D + d_offs) * stride_qnl_d).to(tl.float32)
+    qn2 = tl.load(qnl_base + (2*BLOCK_D + d_offs) * stride_qnl_d).to(tl.float32)
+    qn3 = tl.load(qnl_base + (3*BLOCK_D + d_offs) * stride_qnl_d).to(tl.float32)
+    qr  = tl.load(qr_base + r_offs * stride_qr_d).to(tl.float32)
+
+    # Online softmax state + 4 output accumulators
+    m_i  = tl.full([1], float('-inf'), tl.float32)
+    l_i  = tl.full([1], 0.0, tl.float32)
+    acc0 = tl.zeros([BLOCK_D], tl.float32)
+    acc1 = tl.zeros([BLOCK_D], tl.float32)
+    acc2 = tl.zeros([BLOCK_D], tl.float32)
+    acc3 = tl.zeros([BLOCK_D], tl.float32)
+
+    for start in range(0, kv_len, BLOCK_KV):
+        s_offs = start + kv_offs
+        mask   = s_offs < kv_len
+
+        kr_tile = tl.load(kr_base  + s_offs[:, None] * stride_kr_s  + r_offs[None, :] * stride_kr_d,  mask=mask[:, None], other=0.0).to(tl.float32)
+        kv0     = tl.load(kvn_base + s_offs[:, None] * stride_kvn_s + (0*BLOCK_D + d_offs[None, :]) * stride_kvn_d, mask=mask[:, None], other=0.0).to(tl.float32)
+        kv1     = tl.load(kvn_base + s_offs[:, None] * stride_kvn_s + (1*BLOCK_D + d_offs[None, :]) * stride_kvn_d, mask=mask[:, None], other=0.0).to(tl.float32)
+        kv2     = tl.load(kvn_base + s_offs[:, None] * stride_kvn_s + (2*BLOCK_D + d_offs[None, :]) * stride_kvn_d, mask=mask[:, None], other=0.0).to(tl.float32)
+        kv3     = tl.load(kvn_base + s_offs[:, None] * stride_kvn_s + (3*BLOCK_D + d_offs[None, :]) * stride_kvn_d, mask=mask[:, None], other=0.0).to(tl.float32)
+
+        scores = (tl.sum(kv0 * qn0[None, :], 1) + tl.sum(kv1 * qn1[None, :], 1) +
+                  tl.sum(kv2 * qn2[None, :], 1) + tl.sum(kv3 * qn3[None, :], 1) +
+                  tl.sum(kr_tile * qr[None, :], 1)) * scale
+        scores = tl.where(mask, scores, float('-inf'))
+
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p     = tl.where(mask, tl.exp(scores - m_new), 0.0)
+        l_new = alpha * l_i + tl.sum(p, 0)
+
+        acc0 = alpha * acc0 + tl.sum(p[:, None] * kv0, 0)
+        acc1 = alpha * acc1 + tl.sum(p[:, None] * kv1, 0)
+        acc2 = alpha * acc2 + tl.sum(p[:, None] * kv2, 0)
+        acc3 = alpha * acc3 + tl.sum(p[:, None] * kv3, 0)
+        m_i  = m_new
+        l_i  = l_new
+
+    acc0 = acc0 / l_i;  acc1 = acc1 / l_i
+    acc2 = acc2 / l_i;  acc3 = acc3 / l_i
+
+    out_base = out_ptr + b * stride_ob + h * stride_oh
+    tl.store(out_base + (0*BLOCK_D + d_offs) * stride_od, acc0.to(tl.bfloat16))
+    tl.store(out_base + (1*BLOCK_D + d_offs) * stride_od, acc1.to(tl.bfloat16))
+    tl.store(out_base + (2*BLOCK_D + d_offs) * stride_od, acc2.to(tl.bfloat16))
+    tl.store(out_base + (3*BLOCK_D + d_offs) * stride_od, acc3.to(tl.bfloat16))
+
+
+def _mla_triton_attn(q_nope_latent, q_rope, kv_nope, k_rope, scale, nh):
+    bs, _, dkv = q_nope_latent.shape
+    kv_len     = kv_nope.shape[1]
+    d_rope     = q_rope.shape[2]
+    out        = torch.empty(bs, nh, dkv, dtype=torch.bfloat16, device=kv_nope.device)
+    _mla_flash_kernel[(bs * nh,)](
+        q_nope_latent, q_nope_latent.stride(0), q_nope_latent.stride(1), q_nope_latent.stride(2),
+        q_rope,        q_rope.stride(0),        q_rope.stride(1),        q_rope.stride(2),
+        kv_nope,       kv_nope.stride(0),       kv_nope.stride(1),       kv_nope.stride(2),
+        k_rope,        k_rope.stride(0),        k_rope.stride(1),        k_rope.stride(2),
+        out,           out.stride(0),           out.stride(1),           out.stride(2),
+        kv_len, scale, NH=nh,
+        DKV=dkv, DROPE=d_rope, BLOCK_KV=32, BLOCK_D=128,
+        num_warps=4,
+    )
+    return out
+
+
 def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+    q_nope, q_rope, kv_nope_input, k_rope_input,
     cos_q, sin_q, cos_k, sin_k,
     wK, wV_T, wO,
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
-    """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
-    """
-    # Apply RoPE to queries
+    """Fallback PyTorch attention (used if Triton kernel disabled)."""
     q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
-
-    # Apply RoPE to keys
     k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
     k_rope = k_rope_input * cos_k + k_rope_half * sin_k
-
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
-
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
+    kv_nope_T = kv_nope_input.transpose(1, 2)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
     scores = (scores_nope + scores_rope) * scale
-
-    # Softmax + attention output
     attn = torch.softmax(scores, dim=-1)
     M = torch.matmul(attn, kv_nope_input)
-
-    # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
     y = y_head.reshape(bs, nh * dv).unsqueeze(1)
     return F.linear(y, wO)
 
 
 _compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
+    _attention_inner, mode='max-autotune-no-cudagraphs', dynamic=True
 )
+
+
+def _rotate_half_torch(x):
+    h = x.shape[-1] // 2
+    return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
 
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised MLA decode using Triton flash-attention kernel.
+    Fixes from exp #9: uses full kv_len range with mask (no non-constant bounds),
+    BLOCK_KV=32 to reduce register pressure, correct scalar lse handling.
     """
     config, x, kv_cache = data
 
@@ -241,13 +336,10 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_up = F.linear(q_lora.squeeze(1), wUQ)
     q_up = q_up.view(bs, nh, d_nope + d_rope)
     q_nope = q_up[..., :d_nope]
-    q_rope = q_up[..., d_nope:]
+    q_rope_raw = q_up[..., d_nope:]
 
     kv_nope_input = kv_lora[..., :dkv]
     k_rope_input  = kv_lora[..., dkv:]
-
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
     cos_q = cos_table[query_pos]
@@ -255,19 +347,28 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     cos_k = cos_table[:kv_len]
     sin_k = sin_table[:kv_len]
 
+    # Apply RoPE to queries and keys (PyTorch, before Triton kernel)
+    q_rope = (q_rope_raw * cos_q + _rotate_half_torch(q_rope_raw) * sin_q).contiguous()
+    k_rope = (k_rope_input * cos_k + _rotate_half_torch(k_rope_input) * sin_k).contiguous()
+
+    # Absorb wK into q_nope (PyTorch einsum, before Triton kernel)
     wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
     wK   = wUKV_view[:, :d_nope, :]
     wV   = wUKV_view[:, d_nope:, :]
     wV_T = wV.permute(0, 2, 1)
 
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK).contiguous()  # [bs, nh, dkv]
+    kv_nope_c = kv_nope_input.contiguous()  # [bs, kv_len, dkv]
+
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
-    output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
-        cos_q, sin_q, cos_k, sin_k,
-        wK, wV_T, wO,
-        bs, nh, dkv, d_nope, d_rope, dv, scale,
-    )
+    # Triton flash-attention: output M [bs, nh, dkv]
+    M = _mla_triton_attn(q_nope_latent, q_rope, kv_nope_c, k_rope, scale, nh)
+
+    # Project through wV then wO (PyTorch)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
+    y = y_head.reshape(bs, nh * dv).unsqueeze(1)
+    output = F.linear(y, wO)
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END

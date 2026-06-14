@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -170,67 +168,28 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
-def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
-    cos_q, sin_q, cos_k, sin_k,
-    wK, wV_T, wO,
-    bs, nh, dkv, d_nope, d_rope, dv, scale,
-):
-    """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
-    """
-    # Apply RoPE to queries
-    q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
-
-    # Apply RoPE to keys
-    k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
-
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
-
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores = (scores_nope + scores_rope) * scale
-
-    # Softmax + attention output
-    attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)
-
-    # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
-    y = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    return F.linear(y, wO)
-
-
-_compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
-)
-
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised forward step of the Multi-head Latent Attention (MLA) module.
     """
     config, x, kv_cache = data
 
     bs = config.batch_size
+    sl = config.seq_len
     nh = config.n_heads
+    dq = config.q_lora_rank
     dkv = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
     dv = config.v_head_dim
     msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
+    wUQ = config.Q_proj_up_weight
     wUKV = config.KV_proj_up_weight
-    wO   = config.wo_weight
+    wO = config.wo_weight
 
     q_lora = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
@@ -244,30 +203,43 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_rope = q_up[..., d_nope:]
 
     kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input  = kv_lora[..., dkv:]
-
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
+    k_rope_input = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
-    cos_q = cos_table[query_pos]
-    sin_q = sin_table[query_pos]
+
+    cos_q = cos_table[query_pos].view(d_rope).contiguous()
+    sin_q = sin_table[query_pos].view(d_rope).contiguous()
+    rope_inplace_query(q_rope, cos_q, sin_q)
+
     cos_k = cos_table[:kv_len]
     sin_k = sin_table[:kv_len]
+    k_rope = k_rope_input * cos_k + _rotate_half(k_rope_input) * sin_k
 
     wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
-    wK   = wUKV_view[:, :d_nope, :]
-    wV   = wUKV_view[:, d_nope:, :]
-    wV_T = wV.permute(0, 2, 1)
+    wK = wUKV_view[:, :d_nope, :]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
+
+    kv_nope_T = kv_nope_input.transpose(1, 2)
+    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
+
+    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
+    scores = (scores_nope + scores_rope) * scale
 
-    output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
-        cos_q, sin_q, cos_k, sin_k,
-        wK, wV_T, wO,
-        bs, nh, dkv, d_nope, d_rope, dv, scale,
-    )
+    scores_flat = scores.reshape(bs * nh, kv_len)
+    attn_flat = _triton_softmax(scores_flat)
+    attn = attn_flat.view(bs, nh, kv_len)
+
+    M = torch.matmul(attn, kv_nope_input)
+
+    wV = wUKV_view[:, d_nope:, :]
+    wV_T = wV.permute(0, 2, 1)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
+
+    y = y_head.reshape(bs, nh * dv)
+    y = y.unsqueeze(1)
+    output = F.linear(y, wO)
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END

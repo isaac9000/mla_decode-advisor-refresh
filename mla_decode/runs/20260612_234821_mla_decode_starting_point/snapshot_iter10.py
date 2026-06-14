@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -170,51 +168,94 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
+
 def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+    q_nope_latent, q_rope, kv_nope_input, k_rope_input,
     cos_q, sin_q, cos_k, sin_k,
-    wK, wV_T, wO,
+    wV_T, wO,
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
     """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
+    Compiled attention inner loop.
+    q_nope_latent is already pre-projected (wK absorbed in fused weight).
     """
     # Apply RoPE to queries
     q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
 
     # Apply RoPE to keys
     k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
+    k_rope = k_rope_input * cos_k + k_rope_half * sin_k  # [bs, kv_len, d_rope]
 
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
-
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
+    # Score computation (q_nope_latent already computed via fused GEMM)
+    kv_nope_T = kv_nope_input.transpose(1, 2)
+    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)          # [bs, nh, kv_len]
+    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))   # [bs, nh, kv_len]
     scores = (scores_nope + scores_rope) * scale
 
     # Softmax + attention output
     attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)
+    M = torch.matmul(attn, kv_nope_input)  # [bs, nh, dkv]
 
-    # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
+    # Project through wV
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)  # [bs, nh, dv]
     y = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    return F.linear(y, wO)
+    output = F.linear(y, wO)
+    return output
 
 
-_compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
-)
+_compiled_attention = torch.compile(_attention_inner, mode='reduce-overhead', dynamic=True)
+
+# Cache for fused weights: keyed by (wDQ_ptr, wUQ_ptr)
+_fused_weight_cache = {}
+
+
+def _get_fused_weights(wDQ, wUQ, wUKV, nh, dkv, d_nope, d_rope, dv):
+    """
+    Precompute and cache fused projection weights:
+      wQ_fused = wUQ @ wDQ  shape [nh*(d_nope+d_rope), dim]
+        => q_up = F.linear(x.squeeze(1), wQ_fused)  (single GEMM, no intermediate)
+      wQnl_fused: per-head nope-latent absorption also fused
+        For q_nope_latent = einsum('bhd,hdk->bhk', q_nope, wK):
+          flatten: q_nope [bs, nh*d_nope] @ wK_flat.T where wK_flat [nh*dkv, nh*d_nope] block-diag
+          Precompute wQnl = wK_flat @ wUQ_nope @ wDQ  [nh*dkv, dim]
+          => q_nope_latent = F.linear(x.squeeze(1), wQnl).view(bs, nh, dkv)
+    """
+    key = (wDQ.data_ptr(), wUQ.data_ptr(), wUKV.data_ptr())
+    if key not in _fused_weight_cache:
+        wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
+        wK = wUKV_view[:, :d_nope, :]  # [nh, d_nope, dkv]
+
+        # wUQ layout: [nh*(d_nope+d_rope), dq], rows are [h0_nope, h0_rope, h1_nope, h1_rope, ...]
+        # because q_up.view(bs, nh, d_nope+d_rope) splits each head's output
+        wUQ_bh = wUQ.view(nh, d_nope + d_rope, -1)   # [nh, d_nope+d_rope, dq]
+        wUQ_nope_bh = wUQ_bh[:, :d_nope, :]          # [nh, d_nope, dq]
+        wUQ_rope_bh = wUQ_bh[:, d_nope:, :]          # [nh, d_rope, dq]
+
+        # wQ_fused for rope part: shape [nh*d_rope, dim]
+        wQ_rope_fused = wUQ_rope_bh.reshape(nh * d_rope, -1) @ wDQ  # [nh*d_rope, dim]
+        # wK[h]: [d_nope, dkv], wUQ_nope_bh[h]: [d_nope, dq]
+        # wK[h].T @ wUQ_nope_bh[h] = [dkv, dq]
+        # Batch: [nh, dkv, dq] = wK.permute(0,2,1) @ wUQ_nope_bh
+        wKt = wK.permute(0, 2, 1)              # [nh, dkv, d_nope]
+        # [nh, dkv, d_nope] @ [nh, d_nope, dq] = [nh, dkv, dq]
+        wKU = torch.bmm(wKt, wUQ_nope_bh)     # [nh, dkv, dq]
+        # Then @ wDQ: [nh, dkv, dim]
+        wKU_flat = wKU.reshape(nh * dkv, -1)  # [nh*dkv, dq]
+        wQnl_fused = wKU_flat @ wDQ            # [nh*dkv, dim]
+
+        _fused_weight_cache[key] = (
+            wQ_rope_fused.contiguous(),
+            wQnl_fused.contiguous(),
+        )
+    return _fused_weight_cache[key]
 
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised MLA decode with fused projection weights:
+    - wDQ+wUQ_rope fused -> single GEMM for q_rope
+    - wDQ+wUQ_nope+wK fused -> single GEMM for q_nope_latent
+    Eliminates intermediate q_lora and q_nope tensors, reduces GEMMs.
     """
     config, x, kv_cache = data
 
@@ -226,28 +267,30 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     dv = config.v_head_dim
     msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
+    wUQ = config.Q_proj_up_weight
     wUKV = config.KV_proj_up_weight
-    wO   = config.wo_weight
+    wO = config.wo_weight
 
-    q_lora = F.linear(x, wDQ)
-    kv_lora_input = F.linear(x, wDKV)
+    # Get fused weights (precomputed + cached)
+    wQ_rope_fused, wQnl_fused = _get_fused_weights(
+        wDQ, wUQ, wUKV, nh, dkv, d_nope, d_rope, dv
+    )
 
-    kv_lora, kv_len = kv_cache(kv_lora_input)
+    x2d = x.squeeze(1)  # [bs, dim]
+
+    # Fused projections: single GEMM each instead of two chained GEMMs
+    q_nope_latent = F.linear(x2d, wQnl_fused).view(bs, nh, dkv)   # [bs, nh, dkv]
+    q_rope_raw    = F.linear(x2d, wQ_rope_fused).view(bs, nh, d_rope)  # [bs, nh, d_rope]
+
+    # KV projection (unchanged)
+    kv_lora_input = F.linear(x2d, wDKV)  # [bs, 576]
+    kv_lora, kv_len = kv_cache(kv_lora_input.unsqueeze(1))
     query_pos = kv_len - 1
 
-    q_up = F.linear(q_lora.squeeze(1), wUQ)
-    q_up = q_up.view(bs, nh, d_nope + d_rope)
-    q_nope = q_up[..., :d_nope]
-    q_rope = q_up[..., d_nope:]
-
-    kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input  = kv_lora[..., dkv:]
-
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
+    kv_nope_input = kv_lora[..., :dkv]    # [bs, kv_len, dkv]
+    k_rope_input  = kv_lora[..., dkv:]    # [bs, kv_len, d_rope]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
     cos_q = cos_table[query_pos]
@@ -256,16 +299,16 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     sin_k = sin_table[:kv_len]
 
     wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
-    wK   = wUKV_view[:, :d_nope, :]
-    wV   = wUKV_view[:, d_nope:, :]
-    wV_T = wV.permute(0, 2, 1)
+    wV = wUKV_view[:, d_nope:, :]
+    wV_T = wV.permute(0, 2, 1)  # [nh, dkv, dv]
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
+    # Attention (compiled) — q_nope_latent already computed via fused GEMM
     output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+        q_nope_latent, q_rope_raw, kv_nope_input, k_rope_input,
         cos_q, sin_q, cos_k, sin_k,
-        wK, wV_T, wO,
+        wV_T, wO,
         bs, nh, dkv, d_nope, d_rope, dv, scale,
     )
 

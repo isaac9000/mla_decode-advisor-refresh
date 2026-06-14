@@ -1,8 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — best submission: torch.compile(max-autotune-no-cudagraphs, dynamic=True).
-Covers attention inner loop (RoPE, wK absorption, score matmuls, softmax, wV+wO).
-Confirmed best: ~2657 µs (7.5% improvement over 2874 µs baseline).
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
 import os
@@ -171,26 +169,26 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input, k_rope_neg,
     cos_q, sin_q, cos_k, sin_k,
     wK, wV_T, wO,
     bs, nh, dkv, d_nope, d_rope, dv, scale,
 ):
     """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
+    Compiled attention inner loop.
+    Cleanups: removed unused wUQ, pre-transposed kv_nope, pre-computed k_rope_neg.
+    Removes two torch.cat ops from compiled graph — one per RoPE application.
     """
-    # Apply RoPE to queries
+    # Apply RoPE to queries (one torch.cat remains — q_rope_neg not pre-computed)
     q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
 
-    # Apply RoPE to keys
-    k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
+    # Apply RoPE to keys (k_rope_neg pre-computed outside — no torch.cat here)
+    k_rope = k_rope_input * cos_k + k_rope_neg * sin_k
 
     # Absorb wK
     q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
 
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
+    # Score computation (kv_nope_T pre-transposed outside)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
     scores = (scores_nope + scores_rope) * scale
@@ -246,8 +244,10 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = kv_lora[..., :dkv]
     k_rope_input  = kv_lora[..., dkv:]
 
-    # Pre-transpose outside compiled scope (free metadata op)
+    # Pre-compute ops outside compiled scope (free/cheap metadata ops)
     kv_nope_T = kv_nope_input.transpose(1, 2)
+    # Pre-compute negated-swapped k_rope for RoPE: avoids torch.cat inside compiled graph
+    k_rope_neg = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
     cos_q = cos_table[query_pos]
@@ -263,7 +263,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
     output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
+        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input, k_rope_neg,
         cos_q, sin_q, cos_k, sin_k,
         wK, wV_T, wO,
         bs, nh, dkv, d_nope, d_rope, dv, scale,

@@ -1,0 +1,27 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	2873.91	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	99974.09	discard	Advisor proposed: Replace attention phase with fused Triton flash-attention kernel that computes nop
+3	2	HEAD	0.00	crash	Advisor proposed: Replace explicit matmul+softmax attention with F.scaled_dot_product_attention (SDP
+4	3	HEAD	2713.43	keep	Advisor proposed: Use torch.compile on the compute-intensive attention inner loop with mode='reduce-
+5	4	HEAD	6121.56	discard	Advisor proposed: Switch torch.compile from dynamic=True to static shapes (dynamic=False) with per-k
+6	5	HEAD	0.00	crash	Advisor proposed: Use SDPA with attn_mask=scores_nope on rope component (head_dim=64) and GQA (1 KV 
+7	6	HEAD	0.00	crash	Advisor proposed: Use FlashInfer if available, otherwise split dkv=512 into 4 chunks of 128 and call
+8	7	HEAD	71686.56	discard	Advisor proposed: Properly parallelized Triton flash-attention using tl.dot tensor cores, splitting 
+9	8	HEAD	0.00	crash	Advisor proposed: Split-K Triton kernel where grid=(bs*nh*NUM_SPLITS), each CTA handles kv_len/NUM_S
+10	9	HEAD	2912.68	discard	Advisor proposed: Fuse wDQ+wUQ+wK projections into single GEMMs to eliminate intermediate tensors. I
+11	10	HEAD	0.00	crash	Advisor proposed: Replace einsum with explicit torch.bmm/matmul using optimal shapes for direct cuBL
+12	11	HEAD	2657.48	keep	Advisor proposed: Switch torch.compile from reduce-overhead to max-autotune-no-cudagraphs to enable 
+13	12	HEAD	2752.11	discard	Advisor proposed: Widen torch.compile(max-autotune-no-cudagraphs) scope to include wDQ and wUQ proje
+14	13	HEAD	295304.47	discard	Advisor proposed: Per-kv_len compile cache with torch.compile(max-autotune-no-cudagraphs, dynamic=Fa
+15	14	HEAD	4435.67	discard	Advisor proposed: Dual compilation — outer projections (wDQ, wUQ, wDKV) compiled with dynamic=False 
+16	15	HEAD	7566.85	discard	Advisor proposed: Fuse two score matmuls (nope + rope) into single matmul by concatenating Q=[q_nope
+17	16	HEAD	3523.49	discard	Advisor proposed: Add .contiguous() on KV cache slices (kv_nope, k_rope) and query slices (q_nope, q
+18	17	HEAD	2791.20	discard	Advisor proposed: KVCache may be returning full [bs, max_seq_len, 576] instead of [bs, kv_len, 576],
+19	18	HEAD	66906.43	discard	Advisor proposed: Retry split-K Triton kernel with exp #9 bug fixes: (1) full kv_len range with mask
+20	19	HEAD	2668.93	discard	Advisor proposed: Add fullgraph=True to torch.compile to force single unified graph without graph br
+21	20	HEAD	2956.03	discard	Advisor proposed: Add torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=True and tor
+22	21	HEAD	2909.34	discard	Advisor proposed: Try mode='max-autotune' (with CUDA graphs) instead of 'max-autotune-no-cudagraphs'
+23	22	HEAD	2657.07	keep	Advisor proposed: Clean up exp #12 structure — remove unused wUQ arg from _attention_inner, pre-tran
+24	23	HEAD	2776.82	discard	Advisor proposed: Re-run exp #23 unchanged. Instead made one micro-optimization: pre-compute k_rope_
+25	24	HEAD	2671.31	discard	Final iteration: Reverted exp #24's k_rope_neg change back to exp #23's exact code (torch.cat inside
+26	25	HEAD	2656.80	keep	Final iteration (25/25): Updated docstring to mark as final best submission — otherwise identical to
