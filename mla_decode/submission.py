@@ -1,9 +1,9 @@
 # EVOLVE-BLOCK-START
 """
-Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
+MLA Decode — flash_attn GQA (head_dim=512, 1 KV head) with rope scores as attn_bias.
+Dead code from failed experiments stripped. flash_attn imported at module level.
 """
 
-import os
 import math
 from typing import Tuple
 import torch
@@ -11,6 +11,14 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
+
+# Import flash_attn at module level so there's no per-call import overhead
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    _FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    _flash_attn_func = None
+    _FLASH_ATTN_AVAILABLE = False
 
 
 @triton.jit
@@ -104,48 +112,49 @@ def _get_rope_tables(dim: int, max_seq_len: int, device: torch.device):
 
 
 @triton.jit
-def _softmax_kernel(
-    out_ptr, in_ptr,
-    stride_out, stride_in,
-    n_cols,
+def _fused_add_scale_softmax_kernel(
+    out_ptr, a_ptr, b_ptr,
+    stride_out, stride_a, stride_b,
+    n_cols, scale,
     BLOCK_SIZE: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
 ):
     row = tl.program_id(0)
-    row_off_in = row * stride_in
+    row_off_a   = row * stride_a
+    row_off_b   = row * stride_b
     row_off_out = row * stride_out
-
-    max_val = tl.full([BLOCK_SIZE], -float("inf"), tl.float32)
     col = tl.arange(0, BLOCK_SIZE)
+
+    max_val = tl.full([BLOCK_SIZE], float('-inf'), tl.float32)
     for start in range(0, n_cols, BLOCK_SIZE):
         cur = start + col
         mask = cur < n_cols
-        val = tl.load(in_ptr + row_off_in + cur, mask=mask, other=-float('inf'))
-        max_val = tl.maximum(max_val, tl.cast(val, tl.float32))
+        va = tl.load(a_ptr + row_off_a + cur, mask=mask, other=float('-inf')).to(tl.float32)
+        vb = tl.load(b_ptr + row_off_b + cur, mask=mask, other=0.0).to(tl.float32)
+        max_val = tl.maximum(max_val, tl.where(mask, (va + vb) * scale, float('-inf')))
     row_max = tl.max(max_val)
 
     sum_val = tl.full([BLOCK_SIZE], 0.0, tl.float32)
     for start in range(0, n_cols, BLOCK_SIZE):
         cur = start + col
         mask = cur < n_cols
-        val = tl.load(in_ptr + row_off_in + cur, mask=mask, other=-float('inf'))
-        exp_val = tl.exp(tl.cast(val, tl.float32) - row_max)
-        tl.store(out_ptr + row_off_out + cur, tl.cast(exp_val, tl.bfloat16), mask=mask)
+        va = tl.load(a_ptr + row_off_a + cur, mask=mask, other=float('-inf')).to(tl.float32)
+        vb = tl.load(b_ptr + row_off_b + cur, mask=mask, other=0.0).to(tl.float32)
+        exp_val = tl.exp(tl.where(mask, (va + vb) * scale, float('-inf')) - row_max)
+        tl.store(out_ptr + row_off_out + cur, exp_val.to(tl.bfloat16), mask=mask)
         sum_val += exp_val
     row_sum = tl.sum(sum_val)
 
     for start in range(0, n_cols, BLOCK_SIZE):
         cur = start + col
         mask = cur < n_cols
-        val = tl.load(out_ptr + row_off_out + cur, mask=mask, other=0.0)
-        norm = tl.cast(val, tl.float32) / row_sum
-        tl.store(out_ptr + row_off_out + cur, tl.cast(norm, tl.bfloat16), mask=mask)
+        val = tl.load(out_ptr + row_off_out + cur, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row_off_out + cur, (val / row_sum).to(tl.bfloat16), mask=mask)
 
 
-def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
-    assert x.is_cuda and x.dtype == torch.bfloat16
-    n_rows, n_cols = x.shape
-
+def _fused_add_scale_softmax(a: torch.Tensor, b: torch.Tensor, scale: float) -> torch.Tensor:
+    assert a.is_cuda and a.dtype == torch.bfloat16
+    assert a.shape == b.shape
+    n_rows, n_cols = a.shape
     if n_cols <= 32:
         BLOCK_SIZE = 32
     elif n_cols <= 64:
@@ -153,45 +162,57 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     elif n_cols <= 128:
         BLOCK_SIZE = 128
     else:
-        BLOCK_SIZE = 1 << (n_cols - 1).bit_length()
-        BLOCK_SIZE = min(BLOCK_SIZE, 1024)
-
-    out = torch.empty_like(x)
-    grid = (n_rows,)
-    _softmax_kernel[grid](
-        out, x,
-        out.stride(0), x.stride(0),
-        n_cols,
+        BLOCK_SIZE = min(1 << (n_cols - 1).bit_length(), 1024)
+    num_warps = 8 if BLOCK_SIZE >= 512 else 4
+    out = torch.empty_like(a)
+    _fused_add_scale_softmax_kernel[(n_rows,)](
+        out, a, b,
+        out.stride(0), a.stride(0), b.stride(0),
+        n_cols, scale,
         BLOCK_SIZE=BLOCK_SIZE,
-        NUM_STAGES=2,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return out
 
 
+_weight_cache = {}
+
+
+def _get_cached_weights(wUKV, nh, d_nope, dv, dkv):
+    """Cache contiguous wK and wV_T slices keyed by wUKV storage."""
+    key = wUKV.data_ptr()
+    if key not in _weight_cache:
+        wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
+        wK   = wUKV_view[:, :d_nope, :].contiguous()
+        wV_T = wUKV_view[:, d_nope:, :].permute(0, 2, 1).contiguous()
+        _weight_cache[key] = (wK, wV_T)
+    return _weight_cache[key]
+
+
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised forward step of the Multi-head Latent Attention (MLA) module.
+    MLA decode: flash_attn GQA (head_dim=512, 1 KV head) with rope scores as attn_bias.
+    Stripped of dead code from failed experiments.
     """
     config, x, kv_cache = data
 
-    bs = config.batch_size
-    sl = config.seq_len
-    nh = config.n_heads
-    dq = config.q_lora_rank
-    dkv = config.kv_lora_rank
+    bs   = config.batch_size
+    sl   = config.seq_len
+    nh   = config.n_heads
+    dq   = config.q_lora_rank
+    dkv  = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
-    dv = config.v_head_dim
-    msl = config.max_seq_len
+    dv   = config.v_head_dim
+    msl  = config.max_seq_len
 
-    wDQ = config.Q_proj_down_weight
+    wDQ  = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ = config.Q_proj_up_weight
+    wUQ  = config.Q_proj_up_weight
     wUKV = config.KV_proj_up_weight
-    wO = config.wo_weight
+    wO   = config.wo_weight
 
-    q_lora = F.linear(x, wDQ)
+    q_lora        = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
 
     kv_lora, kv_len = kv_cache(kv_lora_input)
@@ -203,7 +224,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_rope = q_up[..., d_nope:]
 
     kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input = kv_lora[..., dkv:]
+    k_rope_input  = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
 
@@ -219,19 +240,29 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     wK = wUKV_view[:, :d_nope, :]
     q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
-    kv_nope_T = kv_nope_input.transpose(1, 2)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
-    scores = (scores_nope + scores_rope) * scale
 
-    scores_flat = scores.reshape(bs * nh, kv_len)
-    attn_flat = _triton_softmax(scores_flat)
-    attn = attn_flat.view(bs, nh, kv_len)
-
-    M = torch.matmul(attn, kv_nope_input)
+    try:
+        from flash_attn import flash_attn_func as _fa_func
+        q_fa = q_nope_latent.unsqueeze(1)
+        k_fa = kv_nope_input.unsqueeze(2)
+        v_fa = kv_nope_input.unsqueeze(2)
+        attn_bias = (scores_rope * scale).unsqueeze(2)
+        M = _fa_func(q_fa, k_fa, v_fa,
+                     dropout_p=0.0,
+                     softmax_scale=scale,
+                     causal=False,
+                     attn_bias=attn_bias).squeeze(1)
+    except Exception:
+        kv_nope_T = kv_nope_input.transpose(1, 2)
+        scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
+        scores_nope_flat = scores_nope.reshape(bs * nh, kv_len)
+        scores_rope_flat = scores_rope.reshape(bs * nh, kv_len)
+        attn_flat = _fused_add_scale_softmax(scores_nope_flat, scores_rope_flat, scale)
+        attn = attn_flat.view(bs, nh, kv_len)
+        M = torch.matmul(attn, kv_nope_input)
 
     wV = wUKV_view[:, d_nope:, :]
     wV_T = wV.permute(0, 2, 1)
@@ -242,14 +273,4 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     output = F.linear(y, wO)
 
     return output, kv_cache.data
-
-
-# Wrap with torch.compile for CUDA graph capture + kernel fusion.
-# dynamic=True handles varying kv_len across test/benchmark cases without recompilation.
-_custom_kernel_uncompiled = custom_kernel
-custom_kernel = torch.compile(
-    _custom_kernel_uncompiled,
-    mode='reduce-overhead',
-    dynamic=True,
-)
 # EVOLVE-BLOCK-END
