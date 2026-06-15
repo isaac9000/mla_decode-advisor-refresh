@@ -10,51 +10,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
-try:
-    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
-    _HAS_FLASH_ATTN = True
-except ImportError:
-    _HAS_FLASH_ATTN = False
 
 # Weight cache: contiguous wK and wV_T to avoid repeated view+slice each call
 _weight_cache = {}
-
-
-@triton.jit
-def rope_rotate_copy_kernel(
-    # Reads from src [bs, new_t, d_rope], writes to dst [bs, msl, d_rope] at offset t_off
-    src_ptr, dst_ptr,
-    cos_ptr, sin_ptr,
-    stride_sb, stride_st, stride_sd,
-    stride_db, stride_dt, stride_dd,
-    stride_ct, stride_cd,
-    new_t,
-    t_off,
-    HALF_D: tl.constexpr,
-):
-    """Read k_rope from src, apply RoPE, write to dst at offset t_off. One program per (b, t)."""
-    pid  = tl.program_id(0)
-    bs_v = tl.num_programs(1)  # unused — grid is 1D: (bs*new_t,)
-    b    = pid // new_t
-    t    = pid - b * new_t      # local token index in [0, new_t)
-    t_abs = t + t_off           # absolute position for cos/sin
-
-    offs = tl.arange(0, HALF_D)
-
-    src_base = src_ptr + b * stride_sb + t * stride_st
-    dst_base = dst_ptr + b * stride_db + (t + t_off) * stride_dt
-
-    x0 = tl.load(src_base + offs * stride_sd).to(tl.float32)
-    x1 = tl.load(src_base + (HALF_D + offs) * stride_sd).to(tl.float32)
-
-    c = tl.load(cos_ptr + t_abs * stride_ct + offs * stride_cd).to(tl.float32)
-    s = tl.load(sin_ptr + t_abs * stride_ct + offs * stride_cd).to(tl.float32)
-
-    out0 = x0 * c - x1 * s
-    out1 = x1 * c + x0 * s
-
-    tl.store(dst_base + offs * stride_dd,           out0.to(tl.bfloat16))
-    tl.store(dst_base + (HALF_D + offs) * stride_dd, out1.to(tl.bfloat16))
 
 
 @triton.jit
@@ -300,8 +258,8 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     if filled < kv_len:
         # kv_nope part: copy from kv_lora[..., :dkv]
         k_full_buf[:, filled:kv_len, :dkv] = kv_lora[:, filled:kv_len, :dkv]
-        # k_rope part: rotate and store (torch.cat approach, fast for small new_t)
-        k_rope_miss = kv_lora[:, filled:kv_len, dkv:]
+        # k_rope part: rotate and store
+        k_rope_miss = kv_lora[:, filled:kv_len, dkv:]   # [bs, new_t, d_rope]
         cos_m = cos_table[filled:kv_len]
         sin_m = sin_table[filled:kv_len]
         k_full_buf[:, filled:kv_len, dkv:] = (
@@ -319,26 +277,46 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
         _q_full_buf_cache[cfg_id] = torch.empty(bs, nh, dk_full, dtype=x.dtype, device=x.device)
     q_full_buf = _q_full_buf_cache[cfg_id]   # [bs, nh, dkv+d_rope]
 
-    # q_full: write q_nope_latent and q_rope into pre-allocated buffer (no torch.cat alloc)
-    q_nope_latent = torch.bmm(q_nope.permute(1, 0, 2), wK).permute(1, 0, 2)   # [bs, nh, dkv]
+    # Pre-allocate persistent attention buffers keyed by (config_id, max_seq_len)
+    pb_key = (cfg_id, msl)
+    if pb_key not in _persistent_bufs:
+        _persistent_bufs[pb_key] = {
+            'scores': torch.empty(bs, nh, msl, dtype=x.dtype, device=x.device),   # [bs, nh, msl]
+            'attn':   torch.empty(bs * nh, msl, dtype=x.dtype, device=x.device),  # [bs*nh, msl]
+            'M':      torch.empty(bs, nh, dkv,  dtype=x.dtype, device=x.device),  # [bs, nh, dkv]
+            'y_head': torch.empty(bs, nh, dv,   dtype=x.dtype, device=x.device),  # [bs, nh, dv]
+        }
+    pb = _persistent_bufs[pb_key]
+    scores_buf = pb['scores']   # [bs, nh, msl]
+    attn_buf   = pb['attn']     # [bs*nh, msl]
+    M_buf      = pb['M']        # [bs, nh, dkv]
+    y_head_buf = pb['y_head']   # [bs, nh, dv]
+
+    # q_full: write q_nope_latent and q_rope into pre-allocated buffer
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)   # [bs, nh, dkv]
     q_full_buf[:, :, :dkv].copy_(q_nope_latent)
     q_full_buf[:, :, dkv:].copy_(q_rope)
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
-    # Single-GEMM scores: q_full @ k_full^T
-    scores      = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale  # [bs, nh, kv_len]
-    scores_flat = scores.reshape(bs * nh, kv_len)
-    attn_flat   = _triton_softmax(scores_flat)
-    attn        = attn_flat.view(bs, nh, kv_len)
+    # Single-GEMM scores into pre-allocated buffer, then scale in-place
+    scores_view = scores_buf[:, :, :kv_len]   # [bs, nh, kv_len] — view, no alloc
+    torch.matmul(q_full_buf, k_full.transpose(1, 2), out=scores_view)
+    scores_view.mul_(scale)
 
-    # V-weighted sum
-    kv_nope_input = k_full_buf[:, :kv_len, :dkv]
-    M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
+    # Softmax into pre-allocated attn buffer
+    scores_flat = scores_view.reshape(bs * nh, kv_len)   # view, no alloc
+    attn_flat_view = attn_buf[:, :kv_len]                # [bs*nh, kv_len] — view
+    _triton_softmax(scores_flat, out=attn_flat_view)
+    attn = attn_flat_view.view(bs, nh, kv_len)           # view, no alloc
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
-    y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
+    # V-weighted sum into pre-allocated M buffer
+    kv_nope_input = k_full_buf[:, :kv_len, :dkv]         # view into k_full_buf
+    torch.matmul(attn, kv_nope_input, out=M_buf)
+
+    # Output projection: einsum then copy_ into pre-allocated y_head_buf
+    y_head_buf.copy_(torch.einsum('bhd,hdk->bhk', M_buf, wV_T))
+    y      = y_head_buf.reshape(bs, nh * dv).unsqueeze(1)
     output = F.linear(y, wO)
 
     return output, kv_cache.data

@@ -336,10 +336,16 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = k_full_buf[:, :kv_len, :dkv]
     M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
-    y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    output = F.linear(y, wO)
+    # Output projection via bmm then direct mm to wO
+    # y_head_t: [nh, bs, dv] contiguous (no permute copy needed for intermediate)
+    # Reshape to [bs, nh*dv] requires permute+contiguous; use torch.mm on reshaped inputs instead
+    y_head_t = torch.bmm(M.permute(1, 0, 2), wV_T)      # [nh, bs, dv] — contiguous
+    # y_head_t.permute(1,0,2) = [bs, nh, dv] non-contiguous; .reshape triggers copy
+    # Alternative: contiguous in-place via transpose+reshape on [nh*bs, dv] then mm
+    # Use torch.mm([bs, nh*dv], wO.T) but need contiguous [bs, nh*dv]
+    # The permute+reshape copy is unavoidable for nh-bs interleave; use .contiguous() explicitly
+    y_flat  = y_head_t.permute(1, 0, 2).contiguous().view(bs, nh * dv)  # [bs, nh*dv]
+    output  = torch.mm(y_flat, wO.t()).unsqueeze(1)                       # [bs, 1, dim_out]
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END

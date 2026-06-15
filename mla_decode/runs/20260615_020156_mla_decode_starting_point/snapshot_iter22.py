@@ -320,24 +320,30 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_full_buf = _q_full_buf_cache[cfg_id]   # [bs, nh, dkv+d_rope]
 
     # q_full: write q_nope_latent and q_rope into pre-allocated buffer (no torch.cat alloc)
-    q_nope_latent = torch.bmm(q_nope.permute(1, 0, 2), wK).permute(1, 0, 2)   # [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)   # [bs, nh, dkv]
     q_full_buf[:, :, :dkv].copy_(q_nope_latent)
     q_full_buf[:, :, dkv:].copy_(q_rope)
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
-    # Single-GEMM scores: q_full @ k_full^T
-    scores      = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale  # [bs, nh, kv_len]
-    scores_flat = scores.reshape(bs * nh, kv_len)
-    attn_flat   = _triton_softmax(scores_flat)
-    attn        = attn_flat.view(bs, nh, kv_len)
+    # Use flash_attn_with_kvcache: q_full and k_full are already built in the right format.
+    # Reads K and V in a single fused decode pass instead of two separate GEMMs.
+    # q: [bs, 1, nh, dk_full], k_cache: [bs, kv_len, 1, dk_full] (GQA nheads_k=1),
+    # v_cache: [bs, kv_len, 1, dkv], returns: [bs, 1, nh, dkv]
+    q_fa  = q_full_buf.unsqueeze(1)                       # [bs, 1, nh, dk_full]
+    k_fa  = k_full.unsqueeze(2)                            # [bs, kv_len, 1, dk_full]
+    v_fa  = k_full_buf[:, :kv_len, :dkv].contiguous().unsqueeze(2)  # [bs, kv_len, 1, dkv]
+    if _HAS_FLASH_ATTN:
+        out = _flash_attn_with_kvcache(q_fa, k_fa, v_fa, softmax_scale=scale, causal=False)
+        M   = out.squeeze(1)   # [bs, nh, dkv]
+    else:
+        scores  = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale
+        scores_flat = scores.reshape(bs * nh, kv_len)
+        attn_flat   = _triton_softmax(scores_flat)
+        attn        = attn_flat.view(bs, nh, kv_len)
+        M           = torch.matmul(attn, k_full_buf[:, :kv_len, :dkv])
 
-    # V-weighted sum
-    kv_nope_input = k_full_buf[:, :kv_len, :dkv]
-    M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
-
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
     y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
     output = F.linear(y, wO)
 

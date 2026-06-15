@@ -320,7 +320,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_full_buf = _q_full_buf_cache[cfg_id]   # [bs, nh, dkv+d_rope]
 
     # q_full: write q_nope_latent and q_rope into pre-allocated buffer (no torch.cat alloc)
-    q_nope_latent = torch.bmm(q_nope.permute(1, 0, 2), wK).permute(1, 0, 2)   # [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)   # [bs, nh, dkv]
     q_full_buf[:, :, :dkv].copy_(q_nope_latent)
     q_full_buf[:, :, dkv:].copy_(q_rope)
 
@@ -336,8 +336,11 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = k_full_buf[:, :kv_len, :dkv]
     M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
+    # Output projection: bmm instead of einsum to avoid dispatch overhead
+    # M.permute(1,0,2): [nh, bs, dkv] — strided view, cuBLAS handles it
+    # wV_T: [nh, dkv, dv] — contiguous
+    # result: [nh, bs, dv].permute(1,0,2) = [bs, nh, dv]
+    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)
     y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
     output = F.linear(y, wO)
 

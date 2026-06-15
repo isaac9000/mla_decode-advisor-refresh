@@ -1,0 +1,27 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	2767.99	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	201969.79	discard	Advisor proposed replacing the attention phase with SDPA (FlashAttention on H200). Implemented by ma
+3	2	HEAD	148585.14	discard	Advisor proposed a Triton flash-decode kernel operating in compressed latent space (dkv=512), tiling
+4	3	HEAD	3087.86	discard	Advisor proposed precomputing fused weight matrices: (1) wQ_eff = wUQ @ wDQ for single-GEMM Q projec
+5	4	HEAD	7866.72	discard	Advisor proposed replacing einsum with bmm + cached pre-contiguous weights. Implemented by caching w
+6	5	HEAD	3713.38	discard	Advisor proposed two changes to baseline: (1) fused Triton k_rope kernel replacing k*cos + rotate_ha
+7	6	HEAD	2779.80	discard	Advisor proposed torch.compile on the attention core (score GEMMs + softmax + weighted sum) with mod
+8	7	HEAD	3720.19	discard	Advisor proposed adding .contiguous() to kv_nope_input and k_rope_input after slicing from kv_lora, 
+9	8	HEAD	2781.26	discard	Advisor proposed flash_attn_with_kvcache for decode attention. Implemented using the key insight tha
+10	9	HEAD	3057.50	discard	Advisor proposed CUDA streams to overlap independent wDQ and wDKV projections (both read x, write to
+11	10	HEAD	2477.11	keep	Advisor proposed pre-applying RoPE to k_rope before KV cache storage. Implemented as a side buffer (
+12	11	HEAD	2530.82	discard	Advisor proposed combining exp #11's pre-rotated k_rope cache with flash_attn_with_kvcache (from exp
+13	12	HEAD	2421.89	keep	Advisor proposed cleaning up dead code from exp #11 (removed flash_decode_latent_kernel, _rope_keys_
+14	13	HEAD	2446.30	discard	Advisor proposed using kv_lora_input directly for new token's k_rope rotation (contiguous [bs,d_rope
+15	14	HEAD	2469.84	discard	Advisor proposed a kv_nope side buffer [bs, msl, dkv] with stride (msl*dkv, dkv, 1) to eliminate the
+16	15	HEAD	10021.92	discard	Advisor proposed torch.compile(mode='max-autotune', dynamic=False) on attention core + wV projection
+17	16	HEAD	2316.54	keep	Advisor proposed an incremental k_full_buf[bs, msl, dkv+d_rope] storing cat([kv_nope, k_rope_rotated
+18	17	HEAD	2182.39	keep	Advisor proposed pre-allocating q_full_buf[bs, nh, dkv+d_rope] per config to avoid torch.cat allocat
+19	18	HEAD	2551.45	discard	Advisor proposed pre-allocating persistent buffers for scores[bs,nh,msl], attn[bs*nh,msl], M[bs,nh,d
+20	19	HEAD	2200.09	discard	Advisor proposed pre-allocating y_head_buf[nh,bs,dv] and using torch.bmm(M.permute(1,0,2), wV_T, out
+21	20	HEAD	2894.52	discard	Advisor proposed replacing torch.cat + elementwise rotate_half in k_full_buf update with a fused Tri
+22	21	HEAD	3049.93	discard	Advisor proposed using flash_attn_with_kvcache with pre-built q_full_buf and k_full_buf (no torch.ca
+23	22	HEAD	2122.55	keep	Advisor proposed replacing torch.einsum('bhd,hdk->bhk', M, wV_T) with torch.bmm(M.permute(1,0,2), wV
+24	23	HEAD	2094.75	keep	Applied the same einsum→bmm substitution to q_nope_latent: replaced torch.einsum('bhd,hdk->bhk', q_n
+25	24	HEAD	2145.94	discard	Final iteration. Advisor proposed CUDA graphs but that's impractical for variable kv_len. Instead tr
+26	25	HEAD	2116.97	discard	Final iteration (25/25). Restored #24's clean code by reverting #25's broken y_head computation (tor

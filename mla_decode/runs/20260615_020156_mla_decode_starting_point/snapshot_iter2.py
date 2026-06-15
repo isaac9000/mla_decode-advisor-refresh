@@ -169,67 +169,27 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _attention_inner(
-    q_nope, q_rope, kv_nope_input, k_rope_input,
-    cos_q, sin_q, cos_k, sin_k,
-    wK, wV_T, wO,
-    bs, nh, dkv, d_nope, d_rope, dv, scale,
-):
-    """
-    Attention inner loop (exp #12 structure) with contiguous inputs.
-    All KV slices and query slices are contiguous, enabling cuBLAS to use
-    optimal access patterns without stride-handling overhead.
-    """
-    # Apply RoPE to queries
-    q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
-
-    # Apply RoPE to keys
-    k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
-
-    # Absorb wK: q_nope_latent [bs, nh, dkv]
-    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
-
-    # Score computation (separate nope + rope)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores = (scores_nope + scores_rope) * scale
-
-    # Softmax + attention output
-    attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)
-
-    # Project through wV then wO
-    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
-    y = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    return F.linear(y, wO)
-
-
-_compiled_attention = torch.compile(
-    _attention_inner, mode='max-autotune-no-cudagraphs', dynamic=True
-)
-
-
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode with contiguous KV/Q slices for optimal cuBLAS access.
+    Optimised forward step of the Multi-head Latent Attention (MLA) module.
     """
     config, x, kv_cache = data
 
     bs = config.batch_size
+    sl = config.seq_len
     nh = config.n_heads
+    dq = config.q_lora_rank
     dkv = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
     dv = config.v_head_dim
     msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
+    wUQ = config.Q_proj_up_weight
     wUKV = config.KV_proj_up_weight
-    wO   = config.wo_weight
+    wO = config.wo_weight
 
     q_lora = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
@@ -242,30 +202,49 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_nope = q_up[..., :d_nope]
     q_rope = q_up[..., d_nope:]
 
-    # kv_lora is already sliced to [:, :kv_len, :] by KVCache.forward()
-    # so these are [bs, kv_len, dkv] and [bs, kv_len, d_rope] — correct size
     kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input  = kv_lora[..., dkv:]
+    k_rope_input = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
-    cos_q = cos_table[query_pos]
-    sin_q = sin_table[query_pos]
+
+    cos_q = cos_table[query_pos].view(d_rope).contiguous()
+    sin_q = sin_table[query_pos].view(d_rope).contiguous()
+    rope_inplace_query(q_rope, cos_q, sin_q)
+
     cos_k = cos_table[:kv_len]
     sin_k = sin_table[:kv_len]
+    k_rope = k_rope_input * cos_k + _rotate_half(k_rope_input) * sin_k
 
     wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
-    wK   = wUKV_view[:, :d_nope, :]
-    wV   = wUKV_view[:, d_nope:, :]
-    wV_T = wV.permute(0, 2, 1)
+    wK = wUKV_view[:, :d_nope, :]   # [nh, d_nope, dkv]
+    wV = wUKV_view[:, d_nope:, :]   # [nh, dv,     dkv]
 
+    # Materialize per-head K_nope: [bs, kv_len, nh, d_nope] -> [bs, nh, kv_len, d_nope]
+    # kv_nope_input: [bs, kv_len, dkv]
+    # K_nope[b,h,t,:] = kv_nope_input[b,t,:] @ wK[h,:,:].T
+    k_nope = torch.einsum('btd,hkd->bhtk', kv_nope_input, wK)  # [bs, nh, kv_len, d_nope]
+
+    # Materialize per-head V: [bs, nh, kv_len, dv]
+    v = torch.einsum('btd,hvd->bhtv', kv_nope_input, wV)  # [bs, nh, kv_len, dv]
+
+    # k_rope: [bs, kv_len, d_rope] -> [bs, 1, kv_len, d_rope] broadcast over heads
+    k_rope_bcast = k_rope.unsqueeze(1)  # [bs, 1, kv_len, d_rope]
+
+    # Full K: concatenate nope and rope parts along head_dim axis
+    # k_nope: [bs, nh, kv_len, d_nope], k_rope: [bs, 1, kv_len, d_rope]
+    k_full = torch.cat([k_nope, k_rope_bcast.expand(bs, nh, kv_len, d_rope)], dim=-1)  # [bs, nh, kv_len, d_nope+d_rope]
+
+    # Full Q: concatenate q_nope and q_rope, reshape to [bs, nh, 1, d_nope+d_rope]
+    q_full = torch.cat([q_nope, q_rope], dim=-1).unsqueeze(2)  # [bs, nh, 1, d_nope+d_rope]
+
+    # Use SDPA (dispatches to FlashAttention on H200)
     scale = 1.0 / math.sqrt(d_nope + d_rope)
+    y_head = F.scaled_dot_product_attention(q_full, k_full, v, scale=scale)  # [bs, nh, 1, dv]
+    y_head = y_head.squeeze(2)  # [bs, nh, dv]
 
-    output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, k_rope_input,
-        cos_q, sin_q, cos_k, sin_k,
-        wK, wV_T, wO,
-        bs, nh, dkv, d_nope, d_rope, dv, scale,
-    )
+    y = y_head.reshape(bs, nh * dv)
+    y = y.unsqueeze(1)
+    output = F.linear(y, wO)
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END

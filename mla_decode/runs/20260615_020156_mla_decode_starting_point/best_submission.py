@@ -336,8 +336,11 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = k_full_buf[:, :kv_len, :dkv]
     M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
+    # Output projection: bmm instead of einsum to avoid dispatch overhead
+    # M.permute(1,0,2): [nh, bs, dkv] — strided view, cuBLAS handles it
+    # wV_T: [nh, dkv, dv] — contiguous
+    # result: [nh, bs, dv].permute(1,0,2) = [bs, nh, dv]
+    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)
     y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
     output = F.linear(y, wO)
 

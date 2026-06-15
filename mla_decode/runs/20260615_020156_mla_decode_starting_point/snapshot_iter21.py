@@ -10,11 +10,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
-try:
-    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
-    _HAS_FLASH_ATTN = True
-except ImportError:
-    _HAS_FLASH_ATTN = False
 
 # Weight cache: contiguous wK and wV_T to avoid repeated view+slice each call
 _weight_cache = {}
@@ -298,15 +293,23 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
         full_state['filled'] = 0
 
     if filled < kv_len:
+        new_t = kv_len - filled
         # kv_nope part: copy from kv_lora[..., :dkv]
         k_full_buf[:, filled:kv_len, :dkv] = kv_lora[:, filled:kv_len, :dkv]
-        # k_rope part: rotate and store (torch.cat approach, fast for small new_t)
-        k_rope_miss = kv_lora[:, filled:kv_len, dkv:]
-        cos_m = cos_table[filled:kv_len]
-        sin_m = sin_table[filled:kv_len]
-        k_full_buf[:, filled:kv_len, dkv:] = (
-            k_rope_miss * cos_m
-            + torch.cat([-k_rope_miss[..., half:], k_rope_miss[..., :half]], dim=-1) * sin_m
+        # k_rope part: fused RoPE rotate + copy via Triton kernel
+        # Reads kv_lora[b, filled:kv_len, dkv:] and writes rotated to k_full_buf[b, filled:kv_len, dkv:]
+        k_rope_miss = kv_lora[:, filled:kv_len, dkv:]  # [bs, new_t, d_rope] — source (non-contiguous ok)
+        dst_rope    = k_full_buf[:, :, dkv:]            # [bs, msl, d_rope] — destination slice (view)
+        rope_rotate_copy_kernel[(bs * new_t,)](
+            k_rope_miss, dst_rope,
+            cos_table, sin_table,
+            k_rope_miss.stride(0), k_rope_miss.stride(1), k_rope_miss.stride(2),
+            dst_rope.stride(0),    dst_rope.stride(1),    dst_rope.stride(2),
+            cos_table.stride(0),   cos_table.stride(1),
+            new_t=new_t,
+            t_off=filled,
+            HALF_D=half,
+            num_warps=1,
         )
         full_state['filled'] = kv_len
 
@@ -320,14 +323,15 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_full_buf = _q_full_buf_cache[cfg_id]   # [bs, nh, dkv+d_rope]
 
     # q_full: write q_nope_latent and q_rope into pre-allocated buffer (no torch.cat alloc)
-    q_nope_latent = torch.bmm(q_nope.permute(1, 0, 2), wK).permute(1, 0, 2)   # [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)   # [bs, nh, dkv]
     q_full_buf[:, :, :dkv].copy_(q_nope_latent)
     q_full_buf[:, :, dkv:].copy_(q_rope)
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
     # Single-GEMM scores: q_full @ k_full^T
-    scores      = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale  # [bs, nh, kv_len]
+    scores  = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale  # [bs, nh, kv_len]
+
     scores_flat = scores.reshape(bs * nh, kv_len)
     attn_flat   = _triton_softmax(scores_flat)
     attn        = attn_flat.view(bs, nh, kv_len)
@@ -336,8 +340,7 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     kv_nope_input = k_full_buf[:, :kv_len, :dkv]
     M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
     y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
     output = F.linear(y, wO)
 

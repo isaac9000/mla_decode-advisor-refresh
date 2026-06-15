@@ -1,9 +1,8 @@
 # EVOLVE-BLOCK-START
 """
-Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
+MLA Decode — incremental k_rope cache + cached contiguous wK/wV_T weights.
 """
 
-import os
 import math
 from typing import Tuple
 import torch
@@ -11,6 +10,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
+
+# Weight cache: contiguous wK and wV_T to avoid repeated view+slice each call
+_weight_cache = {}
 
 
 @triton.jit
@@ -169,102 +171,123 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _full_compute(
-    x, kv_nope_input, k_rope_input,
-    cos_q, sin_q, cos_k, sin_k,
-    wDQ, wUQ, wK, wV_T, wO,
-    bs, nh, dkv, d_nope, d_rope, dv, scale,
-):
-    """
-    Full compute path compiled under max-autotune-no-cudagraphs.
-    Covers wDQ + wUQ projections, RoPE, attention, wV + wO projections.
-    Excludes only wDKV (feeds KV cache, must stay outside) and KV cache update.
-    """
-    # Q projections (wDQ then wUQ) — now inside compiled scope
-    q_lora = F.linear(x, wDQ)                              # [bs, 1, dq]
-    q_up = F.linear(q_lora.squeeze(1), wUQ)                # [bs, nh*(d_nope+d_rope)]
-    q_up = q_up.view(bs, nh, d_nope + d_rope)
-    q_nope = q_up[..., :d_nope]                            # [bs, nh, d_nope]
-    q_rope = q_up[..., d_nope:]                            # [bs, nh, d_rope]
+def _get_wK_wVT(config):
+    """Cache contiguous wK [nh,d_nope,dkv] and wV_T [nh,dkv,dv] to avoid repeated view+slice."""
+    key = id(config)
+    if key not in _weight_cache:
+        nh     = config.n_heads
+        dkv    = config.kv_lora_rank
+        d_nope = config.qk_nope_head_dim
+        dv     = config.v_head_dim
+        wUKV   = config.KV_proj_up_weight
+        wUKV_v = wUKV.view(nh, d_nope + dv, dkv)
+        wK   = wUKV_v[:, :d_nope, :].contiguous()
+        wV_T = wUKV_v[:, d_nope:, :].permute(0, 2, 1).contiguous()
+        _weight_cache[key] = (wK, wV_T)
+    return _weight_cache[key]
 
-    # Apply RoPE to queries
-    q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
 
-    # Apply RoPE to keys
-    k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k    # [bs, kv_len, d_rope]
+# Per-kv_cache pre-rotated k_rope side buffer
+_kv_rope_cache = {}
 
-    # Absorb wK: q_nope_latent [bs, nh, dkv]
-    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
-
-    # Score computation
-    kv_nope_T = kv_nope_input.transpose(1, 2)
+@torch.compile(mode='reduce-overhead', dynamic=False)
+def _attn_core(
+    q_nope_latent: torch.Tensor,  # [bs, nh, dkv]
+    q_rope:        torch.Tensor,  # [bs, nh, d_rope]
+    kv_nope:       torch.Tensor,  # [bs, kv_len, dkv]
+    k_rope:        torch.Tensor,  # [bs, kv_len, d_rope]  (pre-rotated)
+    wK:            torch.Tensor,  # [nh, d_nope, dkv]  — unused here, passed for shape info
+    wV_T:          torch.Tensor,  # [nh, dkv, dv]
+    scale:         float,
+) -> torch.Tensor:
+    """Compiled attention core + wV projection."""
+    kv_nope_T   = kv_nope.transpose(1, 2)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
     scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores = (scores_nope + scores_rope) * scale
-
-    # Softmax + attention output
-    attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)                  # [bs, nh, dkv]
-
-    # Project through wV then wO
-    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)         # [bs, nh, dv]
-    y = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    return F.linear(y, wO)
-
-
-_compiled_full = torch.compile(_full_compute, mode='max-autotune-no-cudagraphs', dynamic=True)
+    scores      = (scores_nope + scores_rope) * scale
+    attn        = F.softmax(scores, dim=-1)
+    M           = torch.matmul(attn, kv_nope)
+    y_head      = torch.einsum('bhd,hdk->bhk', M, wV_T)
+    return y_head
 
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode with widened torch.compile scope covering all
-    linear projections (wDQ, wUQ, wK, wV, wO) plus attention computation.
-    Only wDKV + KV cache update remain outside compiled scope.
+    MLA decode — #13 clean baseline + torch.compile max-autotune on attention core.
     """
     config, x, kv_cache = data
 
-    bs = config.batch_size
-    nh = config.n_heads
-    dkv = config.kv_lora_rank
+    bs     = config.batch_size
+    nh     = config.n_heads
+    dkv    = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
-    dv = config.v_head_dim
-    msl = config.max_seq_len
+    dv     = config.v_head_dim
+    msl    = config.max_seq_len
 
-    wDQ = config.Q_proj_down_weight
+    wDQ  = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ = config.Q_proj_up_weight
-    wUKV = config.KV_proj_up_weight
-    wO = config.wo_weight
+    wUQ  = config.Q_proj_up_weight
+    wO   = config.wo_weight
 
-    # KV cache update (Python-side state, must stay outside compile)
+    q_lora        = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
+
     kv_lora, kv_len = kv_cache(kv_lora_input)
     query_pos = kv_len - 1
 
+    q_up   = F.linear(q_lora.squeeze(1), wUQ)
+    q_up   = q_up.view(bs, nh, d_nope + d_rope)
+    q_nope = q_up[..., :d_nope]
+    q_rope = q_up[..., d_nope:].contiguous()
+
     kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input  = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
-    cos_q = cos_table[query_pos]
-    sin_q = sin_table[query_pos]
-    cos_k = cos_table[:kv_len]
-    sin_k = sin_table[:kv_len]
 
-    wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
-    wK   = wUKV_view[:, :d_nope, :]    # [nh, d_nope, dkv]
-    wV   = wUKV_view[:, d_nope:, :]    # [nh, dv, dkv]
-    wV_T = wV.permute(0, 2, 1)         # [nh, dkv, dv]
+    cos_q = cos_table[query_pos].view(d_rope).contiguous()
+    sin_q = sin_table[query_pos].view(d_rope).contiguous()
+    rope_inplace_query(q_rope, cos_q, sin_q)
+
+    # --- Pre-rotated k_rope side buffer (incremental) ---
+    kvc_id = id(kv_cache)
+    if kvc_id not in _kv_rope_cache:
+        _kv_rope_cache[kvc_id] = {
+            'buf':    torch.empty(bs, msl, d_rope, dtype=x.dtype, device=x.device),
+            'filled': 0,
+        }
+    rope_state = _kv_rope_cache[kvc_id]
+    k_rope_buf = rope_state['buf']
+    filled     = rope_state['filled']
+    half       = d_rope // 2
+
+    if filled > kv_len:   # reset detection
+        filled = 0
+        rope_state['filled'] = 0
+
+    if filled < kv_len:
+        k_rope_missing = kv_lora[:, filled:kv_len, dkv:]
+        cos_m = cos_table[filled:kv_len]
+        sin_m = sin_table[filled:kv_len]
+        rot = (
+            k_rope_missing * cos_m
+            + torch.cat([-k_rope_missing[..., half:], k_rope_missing[..., :half]], dim=-1) * sin_m
+        )
+        k_rope_buf[:, filled:kv_len, :] = rot
+        rope_state['filled'] = kv_len
+
+    k_rope = k_rope_buf[:, :kv_len, :]  # [bs, kv_len, d_rope]
+
+    wK, wV_T = _get_wK_wVT(config)
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
-    output = _compiled_full(
-        x, kv_nope_input, k_rope_input,
-        cos_q, sin_q, cos_k, sin_k,
-        wDQ, wUQ, wK, wV_T, wO,
-        bs, nh, dkv, d_nope, d_rope, dv, scale,
-    )
+    # Compiled attention core + wV projection
+    y_head = _attn_core(q_nope_latent, q_rope, kv_nope_input, k_rope, wK, wV_T, scale)
+
+    y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
+    output = F.linear(y, wO)
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END

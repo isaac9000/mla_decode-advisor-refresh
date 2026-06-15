@@ -1,6 +1,6 @@
 # EVOLVE-BLOCK-START
 """
-Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
+MLA Decode submission — Triton flash-decode attention in compressed latent space.
 """
 
 import os
@@ -11,6 +11,89 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
+
+
+@triton.jit
+def flash_decode_latent_kernel(
+    # Inputs
+    q_nope_ptr,    # [bs, nh, DKV]
+    q_rope_ptr,    # [bs, nh, DROPE]
+    kv_nope_ptr,   # [bs, kv_len, DKV]
+    k_rope_ptr,    # [bs, kv_len, DROPE]
+    # Output
+    out_ptr,       # [bs, nh, DKV]
+    # Strides
+    stride_qn_b, stride_qn_h, stride_qn_d,
+    stride_qr_b, stride_qr_h, stride_qr_d,
+    stride_kn_b, stride_kn_t, stride_kn_d,
+    stride_kr_b, stride_kr_t, stride_kr_d,
+    stride_o_b, stride_o_h, stride_o_d,
+    # Dims
+    kv_len,
+    DKV: tl.constexpr,
+    DROPE: tl.constexpr,
+    scale,
+    BLOCK_KV: tl.constexpr,
+    BLOCK_DKV: tl.constexpr,
+    BLOCK_DROPE: tl.constexpr,
+):
+    # 2D grid: axis 0 = batch, axis 1 = head
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Load q_nope: [DKV]
+    q_nope_base = q_nope_ptr + pid_b * stride_qn_b + pid_h * stride_qn_h
+    q_rope_base = q_rope_ptr + pid_b * stride_qr_b + pid_h * stride_qr_h
+
+    # Load full q_nope vector into registers (DKV=512, BLOCK_DKV must cover it)
+    offs_dkv = tl.arange(0, BLOCK_DKV)
+    q_nope = tl.load(q_nope_base + offs_dkv * stride_qn_d, mask=offs_dkv < DKV, other=0.0).to(tl.float32)
+
+    offs_drope = tl.arange(0, BLOCK_DROPE)
+    q_rope = tl.load(q_rope_base + offs_drope * stride_qr_d, mask=offs_drope < DROPE, other=0.0).to(tl.float32)
+
+    # Online softmax state
+    m_i = tl.full([1], float('-inf'), tl.float32)
+    l_i = tl.full([1], 0.0, tl.float32)
+    acc = tl.zeros([BLOCK_DKV], tl.float32)
+
+    kv_nope_base = kv_nope_ptr + pid_b * stride_kn_b
+    k_rope_base = k_rope_ptr + pid_b * stride_kr_b
+
+    for start_t in range(0, kv_len, BLOCK_KV):
+        offs_t = start_t + tl.arange(0, BLOCK_KV)
+        mask_t = offs_t < kv_len
+
+        # Load k_nope tile: [BLOCK_KV, DKV]
+        kn_ptrs = kv_nope_base + offs_t[:, None] * stride_kn_t + offs_dkv[None, :] * stride_kn_d
+        k_nope_tile = tl.load(kn_ptrs, mask=mask_t[:, None] & (offs_dkv[None, :] < DKV), other=0.0).to(tl.float32)
+
+        # Load k_rope tile: [BLOCK_KV, DROPE]
+        kr_ptrs = k_rope_base + offs_t[:, None] * stride_kr_t + offs_drope[None, :] * stride_kr_d
+        k_rope_tile = tl.load(kr_ptrs, mask=mask_t[:, None] & (offs_drope[None, :] < DROPE), other=0.0).to(tl.float32)
+
+        # Compute scores: [BLOCK_KV]
+        scores_nope = tl.sum(k_nope_tile * q_nope[None, :], axis=1)   # [BLOCK_KV]
+        scores_rope = tl.sum(k_rope_tile * q_rope[None, :], axis=1)   # [BLOCK_KV]
+        scores = (scores_nope + scores_rope) * scale
+        scores = tl.where(mask_t, scores, float('-inf'))
+
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(scores))
+        exp_scores = tl.exp(scores - m_new)
+        exp_old = tl.exp(m_i - m_new)
+        l_new = exp_old * l_i + tl.sum(exp_scores)
+
+        # Accumulate: acc = acc * (exp_old * l_i / l_new) + sum(exp_scores * k_nope_tile) / l_new
+        # We keep acc unnormalized by l, normalize at the end
+        acc = acc * (exp_old * l_i / l_new) + tl.sum(exp_scores[:, None] * k_nope_tile, axis=0) / l_new
+
+        m_i = m_new
+        l_i = l_new
+
+    # Store output
+    out_base = out_ptr + pid_b * stride_o_b + pid_h * stride_o_h
+    tl.store(out_base + offs_dkv * stride_o_d, acc.to(tl.bfloat16), mask=offs_dkv < DKV)
 
 
 @triton.jit
@@ -168,67 +251,28 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     )
     return out
 
-def _attention_inner(
-    q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
-    cos_q, sin_q, cos_k, sin_k,
-    wK, wV_T, wO,
-    bs, nh, dkv, d_nope, d_rope, dv, scale,
-):
-    """
-    Compiled attention inner loop (exp #23 — confirmed best at 2657 µs).
-    Cleanups vs exp #12: removed unused wUQ arg; kv_nope_T pre-transposed outside.
-    """
-    # Apply RoPE to queries
-    q_rope = q_rope * cos_q + torch.cat((-q_rope[..., d_rope//2:], q_rope[..., :d_rope//2]), dim=-1) * sin_q
-
-    # Apply RoPE to keys
-    k_rope_half = torch.cat((-k_rope_input[..., d_rope//2:], k_rope_input[..., :d_rope//2]), dim=-1)
-    k_rope = k_rope_input * cos_k + k_rope_half * sin_k
-
-    # Absorb wK
-    q_nope_latent = torch.einsum("bhd,hdk->bhk", q_nope, wK)
-
-    # Score computation (kv_nope_T pre-transposed outside compiled scope)
-    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores = (scores_nope + scores_rope) * scale
-
-    # Softmax + attention output
-    attn = torch.softmax(scores, dim=-1)
-    M = torch.matmul(attn, kv_nope_input)
-
-    # Project through wV then wO
-    y_head = torch.einsum("bhd,hdk->bhk", M, wV_T)
-    y = y_head.reshape(bs, nh * dv).unsqueeze(1)
-    return F.linear(y, wO)
-
-
-_compiled_attention = torch.compile(
-    _attention_inner, mode="max-autotune-no-cudagraphs", dynamic=True
-)
-
 
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Optimised MLA decode: exp #12 structure with two cleanups:
-    - removed unused wUQ argument from compiled function
-    - pre-transpose kv_nope outside compiled scope (free metadata op)
+    Optimised forward step of the Multi-head Latent Attention (MLA) module.
     """
     config, x, kv_cache = data
 
     bs = config.batch_size
+    sl = config.seq_len
     nh = config.n_heads
+    dq = config.q_lora_rank
     dkv = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
     dv = config.v_head_dim
     msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
+    wUQ = config.Q_proj_up_weight
     wUKV = config.KV_proj_up_weight
-    wO   = config.wo_weight
+    wO = config.wo_weight
 
     q_lora = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
@@ -242,30 +286,69 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     q_rope = q_up[..., d_nope:]
 
     kv_nope_input = kv_lora[..., :dkv]
-    k_rope_input  = kv_lora[..., dkv:]
-
-    # Pre-transpose outside compiled scope (free metadata op)
-    kv_nope_T = kv_nope_input.transpose(1, 2)
+    k_rope_input = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
-    cos_q = cos_table[query_pos]
-    sin_q = sin_table[query_pos]
+
+    cos_q = cos_table[query_pos].view(d_rope).contiguous()
+    sin_q = sin_table[query_pos].view(d_rope).contiguous()
+    rope_inplace_query(q_rope, cos_q, sin_q)
+
     cos_k = cos_table[:kv_len]
     sin_k = sin_table[:kv_len]
+    k_rope = k_rope_input * cos_k + _rotate_half(k_rope_input) * sin_k
 
     wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
-    wK   = wUKV_view[:, :d_nope, :]
-    wV   = wUKV_view[:, d_nope:, :]
-    wV_T = wV.permute(0, 2, 1)
+    wK = wUKV_view[:, :d_nope, :]   # [nh, d_nope, dkv]
+    wV = wUKV_view[:, d_nope:, :]   # [nh, dv, dkv]
+
+    # Absorb wK into query: q_nope_latent[b,h,:] = q_nope[b,h,:] @ wK[h,:,:] -- shape [bs, nh, dkv]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
+    # q_rope already has RoPE applied: [bs, nh, d_rope]
+    # kv_nope_input: [bs, kv_len, dkv], k_rope: [bs, kv_len, d_rope]
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
 
-    output = _compiled_attention(
-        q_nope, q_rope, kv_nope_input, kv_nope_T, k_rope_input,
-        cos_q, sin_q, cos_k, sin_k,
-        wK, wV_T, wO,
-        bs, nh, dkv, d_nope, d_rope, dv, scale,
+    BLOCK_DKV = 512   # dkv=512, must be power of 2
+    BLOCK_DROPE = 64  # d_rope=64
+    BLOCK_KV = 64     # tile size over sequence length
+
+    # Ensure contiguous
+    q_nope_latent = q_nope_latent.contiguous()
+    q_rope_c = q_rope.contiguous()
+    kv_nope_c = kv_nope_input.contiguous()
+    k_rope_c = k_rope.contiguous()
+
+    M = torch.empty(bs, nh, dkv, dtype=torch.bfloat16, device=x.device)
+
+    grid = (bs, nh)
+    flash_decode_latent_kernel[grid](
+        q_nope_latent, q_rope_c,
+        kv_nope_c, k_rope_c,
+        M,
+        q_nope_latent.stride(0), q_nope_latent.stride(1), q_nope_latent.stride(2),
+        q_rope_c.stride(0), q_rope_c.stride(1), q_rope_c.stride(2),
+        kv_nope_c.stride(0), kv_nope_c.stride(1), kv_nope_c.stride(2),
+        k_rope_c.stride(0), k_rope_c.stride(1), k_rope_c.stride(2),
+        M.stride(0), M.stride(1), M.stride(2),
+        kv_len=kv_len,
+        DKV=dkv,
+        DROPE=d_rope,
+        scale=scale,
+        BLOCK_KV=BLOCK_KV,
+        BLOCK_DKV=BLOCK_DKV,
+        BLOCK_DROPE=BLOCK_DROPE,
+        num_warps=8,
     )
+
+    # Apply wV: y_head[b,h,:] = M[b,h,:] @ wV[h,:,:].T  -> [bs, nh, dv]
+    # M: [bs, nh, dkv], wV: [nh, dv, dkv] -> wV_T: [nh, dkv, dv]
+    wV_T = wV.permute(0, 2, 1)   # [nh, dkv, dv]
+    y_head = torch.einsum('bhd,hdk->bhk', M.to(wV.dtype), wV_T)
+
+    y = y_head.reshape(bs, nh * dv)
+    y = y.unsqueeze(1)
+    output = F.linear(y, wO)
 
     return output, kv_cache.data
 # EVOLVE-BLOCK-END
