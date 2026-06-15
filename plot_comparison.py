@@ -169,7 +169,7 @@ oe_best   = min(oe_by) if oe_by else float("inf")
 evox_best = min(evox_by) if evox_by else float("inf")
 
 # ── Y-axis (negative latency, clip outliers) ──────────────────────────────────
-CLIP_US = 6000.0
+CLIP_US = 4000.0
 all_valid = [t for t in adv_times + refresh_times + oe_times + evox_times if 0 < t <= CLIP_US]
 y_hi = -(min(all_valid) * 0.82)
 y_lo = -(CLIP_US * 1.08)
