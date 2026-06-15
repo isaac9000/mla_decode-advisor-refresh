@@ -1,8 +1,9 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — incremental k_rope cache + cached contiguous wK/wV_T weights.
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
+import os
 import math
 from typing import Tuple
 import torch
@@ -10,51 +11,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
-try:
-    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
-    _HAS_FLASH_ATTN = True
-except ImportError:
-    _HAS_FLASH_ATTN = False
-
-# Weight cache: contiguous wK and wV_T to avoid repeated view+slice each call
-_weight_cache = {}
-
-
-@triton.jit
-def rope_rotate_copy_kernel(
-    # Reads from src [bs, new_t, d_rope], writes to dst [bs, msl, d_rope] at offset t_off
-    src_ptr, dst_ptr,
-    cos_ptr, sin_ptr,
-    stride_sb, stride_st, stride_sd,
-    stride_db, stride_dt, stride_dd,
-    stride_ct, stride_cd,
-    new_t,
-    t_off,
-    HALF_D: tl.constexpr,
-):
-    """Read k_rope from src, apply RoPE, write to dst at offset t_off. One program per (b, t)."""
-    pid  = tl.program_id(0)
-    bs_v = tl.num_programs(1)  # unused — grid is 1D: (bs*new_t,)
-    b    = pid // new_t
-    t    = pid - b * new_t      # local token index in [0, new_t)
-    t_abs = t + t_off           # absolute position for cos/sin
-
-    offs = tl.arange(0, HALF_D)
-
-    src_base = src_ptr + b * stride_sb + t * stride_st
-    dst_base = dst_ptr + b * stride_db + (t + t_off) * stride_dt
-
-    x0 = tl.load(src_base + offs * stride_sd).to(tl.float32)
-    x1 = tl.load(src_base + (HALF_D + offs) * stride_sd).to(tl.float32)
-
-    c = tl.load(cos_ptr + t_abs * stride_ct + offs * stride_cd).to(tl.float32)
-    s = tl.load(sin_ptr + t_abs * stride_ct + offs * stride_cd).to(tl.float32)
-
-    out0 = x0 * c - x1 * s
-    out1 = x1 * c + x0 * s
-
-    tl.store(dst_base + offs * stride_dd,           out0.to(tl.bfloat16))
-    tl.store(dst_base + (HALF_D + offs) * stride_dd, out1.to(tl.bfloat16))
 
 
 @triton.jit
@@ -186,7 +142,7 @@ def _softmax_kernel(
         tl.store(out_ptr + row_off_out + cur, tl.cast(norm, tl.bfloat16), mask=mask)
 
 
-def _triton_softmax(x: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     assert x.is_cuda and x.dtype == torch.bfloat16
     n_rows, n_cols = x.shape
 
@@ -200,8 +156,7 @@ def _triton_softmax(x: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         BLOCK_SIZE = 1 << (n_cols - 1).bit_length()
         BLOCK_SIZE = min(BLOCK_SIZE, 1024)
 
-    if out is None:
-        out = torch.empty_like(x)
+    out = torch.empty_like(x)
     grid = (n_rows,)
     _softmax_kernel[grid](
         out, x,
@@ -214,64 +169,41 @@ def _triton_softmax(x: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
-def _get_wK_wVT(config):
-    """Cache contiguous wK [nh,d_nope,dkv] and wV_T [nh,dkv,dv] to avoid repeated view+slice."""
-    key = id(config)
-    if key not in _weight_cache:
-        nh     = config.n_heads
-        dkv    = config.kv_lora_rank
-        d_nope = config.qk_nope_head_dim
-        dv     = config.v_head_dim
-        wUKV   = config.KV_proj_up_weight
-        wUKV_v = wUKV.view(nh, d_nope + dv, dkv)
-        wK   = wUKV_v[:, :d_nope, :].contiguous()
-        wV_T = wUKV_v[:, d_nope:, :].permute(0, 2, 1).contiguous()
-        _weight_cache[key] = (wK, wV_T)
-    return _weight_cache[key]
-
-
-# Per-kv_cache pre-rotated k_rope side buffer
-# Incremental k_full buffer: stores cat([kv_nope, k_rope_rotated], dim=-1) per token
-# Allows single-GEMM scores computation instead of two separate GEMMs + add
-_kv_full_cache = {}
-
-# Per-config pre-allocated q_full buffer to avoid torch.cat allocation each step
-_q_full_buf_cache = {}
-
-# Per-config pre-allocated persistent buffers for scores, attn, M, y_head
-_persistent_bufs = {}
-
-
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    MLA decode — incremental k_full_buf combines kv_nope + rotated k_rope for single-GEMM scores.
+    Optimised forward step of the Multi-head Latent Attention (MLA) module.
     """
     config, x, kv_cache = data
 
-    bs     = config.batch_size
-    nh     = config.n_heads
-    dkv    = config.kv_lora_rank
+    bs = config.batch_size
+    sl = config.seq_len
+    nh = config.n_heads
+    dq = config.q_lora_rank
+    dkv = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
-    dv     = config.v_head_dim
-    msl    = config.max_seq_len
-    dk_full = dkv + d_rope  # 512 + 64 = 576
+    dv = config.v_head_dim
+    msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
-    wO   = config.wo_weight
+    wUQ = config.Q_proj_up_weight
+    wUKV = config.KV_proj_up_weight
+    wO = config.wo_weight
 
-    q_lora        = F.linear(x, wDQ)
+    q_lora = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
 
     kv_lora, kv_len = kv_cache(kv_lora_input)
     query_pos = kv_len - 1
 
-    q_up   = F.linear(q_lora.squeeze(1), wUQ)
-    q_up   = q_up.view(bs, nh, d_nope + d_rope)
+    q_up = F.linear(q_lora.squeeze(1), wUQ)
+    q_up = q_up.view(bs, nh, d_nope + d_rope)
     q_nope = q_up[..., :d_nope]
-    q_rope = q_up[..., d_nope:].contiguous()
+    q_rope = q_up[..., d_nope:]
+
+    kv_nope_input = kv_lora[..., :dkv]
+    k_rope_input = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
 
@@ -279,67 +211,45 @@ def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Ten
     sin_q = sin_table[query_pos].view(d_rope).contiguous()
     rope_inplace_query(q_rope, cos_q, sin_q)
 
-    # --- Incremental k_full_buf: [bs, msl, dkv+d_rope] ---
-    # k_full_buf[:, t, :dkv]  = kv_nope[t]  (raw, no rotation needed)
-    # k_full_buf[:, t, dkv:]  = k_rope[t]   (pre-rotated)
-    kvc_id = id(kv_cache)
-    if kvc_id not in _kv_full_cache:
-        _kv_full_cache[kvc_id] = {
-            'buf':    torch.empty(bs, msl, dk_full, dtype=x.dtype, device=x.device),
-            'filled': 0,
-        }
-    full_state  = _kv_full_cache[kvc_id]
-    k_full_buf  = full_state['buf']   # [bs, msl, dkv+d_rope]
-    filled      = full_state['filled']
-    half        = d_rope // 2
+    cos_k = cos_table[:kv_len]
+    sin_k = sin_table[:kv_len]
+    k_rope = k_rope_input * cos_k + _rotate_half(k_rope_input) * sin_k
 
-    if filled > kv_len:   # reset detection
-        filled = 0
-        full_state['filled'] = 0
+    wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
+    wK = wUKV_view[:, :d_nope, :]
+    q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
-    if filled < kv_len:
-        # kv_nope part: copy from kv_lora[..., :dkv]
-        k_full_buf[:, filled:kv_len, :dkv] = kv_lora[:, filled:kv_len, :dkv]
-        # k_rope part: rotate and store (torch.cat approach, fast for small new_t)
-        k_rope_miss = kv_lora[:, filled:kv_len, dkv:]
-        cos_m = cos_table[filled:kv_len]
-        sin_m = sin_table[filled:kv_len]
-        k_full_buf[:, filled:kv_len, dkv:] = (
-            k_rope_miss * cos_m
-            + torch.cat([-k_rope_miss[..., half:], k_rope_miss[..., :half]], dim=-1) * sin_m
-        )
-        full_state['filled'] = kv_len
+    kv_nope_T = kv_nope_input.transpose(1, 2)
+    scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
 
-    k_full = k_full_buf[:, :kv_len, :]   # [bs, kv_len, dkv+d_rope]
-
-    wK, wV_T = _get_wK_wVT(config)
-
-    cfg_id = id(config)
-    if cfg_id not in _q_full_buf_cache:
-        _q_full_buf_cache[cfg_id] = torch.empty(bs, nh, dk_full, dtype=x.dtype, device=x.device)
-    q_full_buf = _q_full_buf_cache[cfg_id]   # [bs, nh, dkv+d_rope]
-
-    # q_full: write q_nope_latent and q_rope into pre-allocated buffer (no torch.cat alloc)
-    q_nope_latent = torch.bmm(q_nope.permute(1, 0, 2), wK).permute(1, 0, 2)   # [bs, nh, dkv]
-    q_full_buf[:, :, :dkv].copy_(q_nope_latent)
-    q_full_buf[:, :, dkv:].copy_(q_rope)
+    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
 
     scale = 1.0 / math.sqrt(d_nope + d_rope)
+    scores = (scores_nope + scores_rope) * scale
 
-    # Single-GEMM scores: q_full @ k_full^T
-    scores      = torch.matmul(q_full_buf, k_full.transpose(1, 2)) * scale  # [bs, nh, kv_len]
     scores_flat = scores.reshape(bs * nh, kv_len)
-    attn_flat   = _triton_softmax(scores_flat)
-    attn        = attn_flat.view(bs, nh, kv_len)
+    attn_flat = _triton_softmax(scores_flat)
+    attn = attn_flat.view(bs, nh, kv_len)
 
-    # V-weighted sum
-    kv_nope_input = k_full_buf[:, :kv_len, :dkv]
-    M             = torch.matmul(attn, kv_nope_input)   # [bs, nh, dkv]
+    M = torch.matmul(attn, kv_nope_input)
 
-    # Output projection: bmm [nh,bs,dkv]×[nh,dkv,dv] → [nh,bs,dv], permute → [bs,nh,dv]
-    y_head = torch.bmm(M.permute(1, 0, 2), wV_T).permute(1, 0, 2)   # [bs, nh, dv]
-    y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
+    wV = wUKV_view[:, d_nope:, :]
+    wV_T = wV.permute(0, 2, 1)
+    y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
+
+    y = y_head.reshape(bs, nh * dv)
+    y = y.unsqueeze(1)
     output = F.linear(y, wO)
 
     return output, kv_cache.data
+
+
+# Wrap with torch.compile for CUDA graph capture + kernel fusion.
+# dynamic=True handles varying kv_len across test/benchmark cases without recompilation.
+_custom_kernel_uncompiled = custom_kernel
+custom_kernel = torch.compile(
+    _custom_kernel_uncompiled,
+    mode='reduce-overhead',
+    dynamic=True,
+)
 # EVOLVE-BLOCK-END

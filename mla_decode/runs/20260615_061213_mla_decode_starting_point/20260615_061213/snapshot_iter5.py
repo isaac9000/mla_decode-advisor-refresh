@@ -1,8 +1,9 @@
 # EVOLVE-BLOCK-START
 """
-MLA Decode — incremental k_rope cache + cached contiguous wK/wV_T weights.
+Initial MLA Decode submission — optimised baseline with Triton softmax and RoPE kernels.
 """
 
+import os
 import math
 from typing import Tuple
 import torch
@@ -10,9 +11,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from reference import KVCache, Config
-
-# Weight cache: contiguous wK and wV_T to avoid repeated view+slice each call
-_weight_cache = {}
 
 
 @triton.jit
@@ -171,153 +169,76 @@ def _triton_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _get_wK_wVT(config):
-    """Cache contiguous wK [nh,d_nope,dkv] and wV_T [nh,dkv,dv] to avoid repeated view+slice."""
-    key = id(config)
-    if key not in _weight_cache:
-        nh     = config.n_heads
-        dkv    = config.kv_lora_rank
-        d_nope = config.qk_nope_head_dim
-        dv     = config.v_head_dim
-        wUKV   = config.KV_proj_up_weight
-        wUKV_v = wUKV.view(nh, d_nope + dv, dkv)
-        wK   = wUKV_v[:, :d_nope, :].contiguous()
-        wV_T = wUKV_v[:, d_nope:, :].permute(0, 2, 1).contiguous()
-        _weight_cache[key] = (wK, wV_T)
-    return _weight_cache[key]
-
-
-# Per-kv_cache pre-rotated k_rope side buffer
-_kv_rope_cache = {}
-
-# Per-kv_cache contiguous kv_nope buffer: stride (msl*dkv, dkv, 1) vs (msl*576, 576, 1)
-_kv_nope_cache = {}
-
-
 def custom_kernel(data: Tuple[Config, torch.Tensor, KVCache]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    MLA decode — pre-rotated k_rope cache + cached contiguous wK/wV_T.
+    Optimised forward step of the Multi-head Latent Attention (MLA) module.
     """
     config, x, kv_cache = data
 
-    bs     = config.batch_size
-    nh     = config.n_heads
-    dkv    = config.kv_lora_rank
+    bs = config.batch_size
+    sl = config.seq_len
+    nh = config.n_heads
+    dq = config.q_lora_rank
+    dkv = config.kv_lora_rank
     d_nope = config.qk_nope_head_dim
     d_rope = config.qk_rope_head_dim
-    dv     = config.v_head_dim
-    msl    = config.max_seq_len
+    dv = config.v_head_dim
+    msl = config.max_seq_len
 
-    wDQ  = config.Q_proj_down_weight
+    wDQ = config.Q_proj_down_weight
     wDKV = config.KV_proj_down_weight
-    wUQ  = config.Q_proj_up_weight
-    wO   = config.wo_weight
+    wUQ = config.Q_proj_up_weight
+    wUKV = config.KV_proj_up_weight
+    wO = config.wo_weight
 
     q_lora = F.linear(x, wDQ)
     kv_lora_input = F.linear(x, wDKV)
 
     kv_lora, kv_len = kv_cache(kv_lora_input)
-    query_pos = kv_len - 1  # index of current (new) token
+    query_pos = kv_len - 1
 
     q_up = F.linear(q_lora.squeeze(1), wUQ)
     q_up = q_up.view(bs, nh, d_nope + d_rope)
     q_nope = q_up[..., :d_nope]
     q_rope = q_up[..., d_nope:]
 
-    # --- kv_nope side buffer: contiguous [bs, msl, dkv] with stride (msl*dkv, dkv, 1)
-    # vs kv_lora[..., :dkv] which has stride (msl*576, 576, 1) — wastes 11% bandwidth
-    kvc_id = id(kv_cache)
-    if kvc_id not in _kv_nope_cache:
-        _kv_nope_cache[kvc_id] = {
-            'buf':    torch.empty(bs, msl, dkv, dtype=x.dtype, device=x.device),
-            'filled': 0,
-        }
-    nope_state  = _kv_nope_cache[kvc_id]
-    kv_nope_buf = nope_state['buf']
-    nope_filled = nope_state['filled']
-    # Detect kv_cache reset (seq_len was zeroed by kv_cache.zero())
-    if nope_filled > kv_len:
-        nope_filled = 0
-        nope_state['filled'] = 0
-    if nope_filled < kv_len:
-        kv_nope_buf[:, nope_filled:kv_len, :] = kv_lora[:, nope_filled:kv_len, :dkv]
-        nope_state['filled'] = kv_len
-    kv_nope_input = kv_nope_buf[:, :kv_len, :]  # [bs, kv_len, dkv] — stride (msl*dkv, dkv, 1)
-
-    # k_rope for current token: read from kv_lora_input (contiguous [bs,1,576])
-    # rather than from the full non-contiguous kv_lora slice
-    k_rope_new_raw = kv_lora_input.squeeze(1)[:, dkv:]  # [bs, d_rope] — contiguous
+    kv_nope_input = kv_lora[..., :dkv]
+    k_rope_input = kv_lora[..., dkv:]
 
     cos_table, sin_table = _get_rope_tables(d_rope, msl, x.device)
 
-    # --- Query RoPE (in-place, unchanged) ---
     cos_q = cos_table[query_pos].view(d_rope).contiguous()
     sin_q = sin_table[query_pos].view(d_rope).contiguous()
     rope_inplace_query(q_rope, cos_q, sin_q)
 
-    # --- Pre-rotated k_rope side buffer ---
-    # Incremental: only rotate newly added token(s) each step.
-    kvc_id = id(kv_cache)
-    if kvc_id not in _kv_rope_cache:
-        _kv_rope_cache[kvc_id] = {
-            'buf':    torch.empty(bs, msl, d_rope, dtype=x.dtype, device=x.device),
-            'filled': 0,
-        }
+    cos_k = cos_table[:kv_len]
+    sin_k = sin_table[:kv_len]
+    k_rope = k_rope_input * cos_k + _rotate_half(k_rope_input) * sin_k
 
-    rope_state = _kv_rope_cache[kvc_id]
-    k_rope_buf = rope_state['buf']   # [bs, msl, d_rope]
-    filled     = rope_state['filled']
-    half       = d_rope // 2
-
-    # Detect kv_cache reset
-    if filled > kv_len:
-        filled = 0
-        rope_state['filled'] = 0
-
-    if filled < kv_len:
-        if kv_len - filled == 1:
-            # Common decode path: exactly 1 new token — use contiguous kv_lora_input directly
-            cos_new = cos_table[query_pos]   # [d_rope]
-            sin_new = sin_table[query_pos]   # [d_rope]
-            k_rot = (
-                k_rope_new_raw * cos_new
-                + torch.cat([-k_rope_new_raw[:, half:], k_rope_new_raw[:, :half]], dim=-1) * sin_new
-            )  # [bs, d_rope]
-            k_rope_buf[:, query_pos, :] = k_rot
-        else:
-            # Prefill / multi-token case: rotate all missing from kv_lora cache
-            k_rope_missing = kv_lora[:, filled:kv_len, dkv:]   # [bs, new_tokens, d_rope]
-            cos_m = cos_table[filled:kv_len]
-            sin_m = sin_table[filled:kv_len]
-            rot = (
-                k_rope_missing * cos_m
-                + torch.cat([-k_rope_missing[..., half:], k_rope_missing[..., :half]], dim=-1) * sin_m
-            )
-            k_rope_buf[:, filled:kv_len, :] = rot
-        rope_state['filled'] = kv_len
-
-    # All kv_len positions are now pre-rotated in buffer
-    k_rope = k_rope_buf[:, :kv_len, :]   # [bs, kv_len, d_rope]
-
-    # Cached contiguous wK [nh, d_nope, dkv] and wV_T [nh, dkv, dv]
-    wK, wV_T = _get_wK_wVT(config)
+    wUKV_view = wUKV.view(nh, d_nope + dv, dkv)
+    wK = wUKV_view[:, :d_nope, :]
     q_nope_latent = torch.einsum('bhd,hdk->bhk', q_nope, wK)
 
-    scale = 1.0 / math.sqrt(d_nope + d_rope)
-
-    # Attention scores + softmax + weighted sum
-    kv_nope_T   = kv_nope_input.transpose(1, 2)
+    kv_nope_T = kv_nope_input.transpose(1, 2)
     scores_nope = torch.matmul(q_nope_latent, kv_nope_T)
-    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-    scores      = (scores_nope + scores_rope) * scale
-    scores_flat = scores.reshape(bs * nh, kv_len)
-    attn_flat   = _triton_softmax(scores_flat)
-    attn        = attn_flat.view(bs, nh, kv_len)
-    M           = torch.matmul(attn, kv_nope_input)
 
-    # Output projection with cached contiguous wV_T
+    scores_rope = torch.matmul(q_rope, k_rope.transpose(-2, -1))
+
+    scale = 1.0 / math.sqrt(d_nope + d_rope)
+    scores = (scores_nope + scores_rope) * scale
+
+    scores_flat = scores.reshape(bs * nh, kv_len)
+    attn_flat = _triton_softmax(scores_flat)
+    attn = attn_flat.view(bs, nh, kv_len)
+
+    M = torch.matmul(attn, kv_nope_input)
+
+    wV = wUKV_view[:, d_nope:, :]
+    wV_T = wV.permute(0, 2, 1)
     y_head = torch.einsum('bhd,hdk->bhk', M, wV_T)
-    y      = y_head.reshape(bs, nh * dv).unsqueeze(1)
+
+    y = y_head.reshape(bs, nh * dv)
+    y = y.unsqueeze(1)
     output = F.linear(y, wO)
 
     return output, kv_cache.data

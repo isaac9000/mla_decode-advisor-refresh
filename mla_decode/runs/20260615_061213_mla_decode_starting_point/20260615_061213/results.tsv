@@ -1,0 +1,12 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	2740.78	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	5022.43	discard	Advisor proposed replacing score/softmax/V-matmul chain with FlashAttention via torch.nn.functional.
+3	2	HEAD	0.00	crash	Advisor proposed using SDPA in MQA/GQA mode: Q=[bs,128,1,576], K/V=[bs,1,kv_len,576] with no expand,
+4	3	HEAD	95770.18	discard	Advisor proposed a custom Triton fused attention kernel with online softmax (flash-attn style), grid
+5	4	HEAD	0.00	crash	Advisor proposed replacing einsum with explicit bmm and Triton softmax with F.softmax for better cuB
+6	5	HEAD	4741.22	discard	Advisor proposed xformers memory_efficient_attention with Q_rope[bs,1,nh,64], K_rope[bs,kv_len,1,64]
+7	6	HEAD	10351.26	discard	Advisor proposed: (1) single fused score matmul via Q_combined=[q_nope_latent|q_rope] cat and K_comb
+8	7	HEAD	3809.76	discard	Advisor proposed eliminating .contiguous() copies for kv_nope/k_rope slices (using non-contiguous vi
+9	8	HEAD	4081.16	discard	Advisor proposed pre-absorbing wUQ×wK into wUQ_nope_absorbed [nh*dkv, dq]=[65536,1536] and wV×wO int
+10	9	HEAD	6922.98	discard	Advisor proposed fused RoPE+rope_scores Triton kernel (grid bs*nh, serial loop over kv_len) to elimi
+11	10	HEAD	4887.68	discard	Advisor proposed: (1) replace torch.cat-based _rotate_half with torch.roll+sign-flip to avoid alloca

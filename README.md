@@ -185,19 +185,19 @@ uv run modal deploy eval_modal_mla_decode.py
 ### Running the agent
 
 ```bash
-uv run mla_decode/agent.py --iterations 20
+uv run mla_decode/agent.py --epoch-sizes 15 15
 ```
 
 Start from the provided starting point:
 
 ```bash
-uv run mla_decode/agent.py --baseline mla_decode/starting_point.py --iterations 20
+uv run mla_decode/agent.py --baseline mla_decode/starting_point.py --epoch-sizes 15 15
 ```
 
 Use different models for advisor and worker:
 
 ```bash
-uv run mla_decode/agent.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6 --iterations 20
+uv run mla_decode/agent.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6 --epoch-sizes 15 15
 ```
 
 Evaluate a kernel file without running the agent:
@@ -228,14 +228,16 @@ mla_decode/
 
 ## Run directories
 
-Each run directory (under `vectoradd/runs/` or `mla_decode/runs/`) contains:
-- `experiment_history.md` — full log of every attempt with code and result
-- `results.tsv` — tab-separated summary for plotting
+Each run directory (under `mla_decode/runs/`) contains one subdirectory per epoch (timestamp-named). Each epoch directory contains:
+- `experiment_history.md` — full log of every attempt with code and result (deleted after epoch commit)
+- `results.tsv` — tab-separated summary for plotting (deleted after epoch commit)
 - `progress.png` — latency scatter plot updated each experiment; shows keep/discard/crash points, best-time step line, and cumulative LLM call count
 - `iterations.png` — best latency per advisor iteration
-- `best_submission.py` — snapshot of the fastest kernel found so far
+- `best_submission.py` — snapshot of the fastest kernel found so far (preserved as next epoch's baseline)
 - `proposals.md` — advisor proposals for every iteration
 - `snapshot_iter{N}.py` — per-iteration snapshot of submission.py before the worker edits it
+
+At the end of each epoch the directory is git-committed and artifacts are cleared so the next epoch's agents start blind.
 
 ## LLM Call Counter
 
